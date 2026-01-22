@@ -168,16 +168,261 @@ class KernelBuilder:
                 self.add("valu", (g_op3, v_tmp2, v_val, v_shift))
                 self.add("valu", (g_op2, v_val, v_tmp1, v_tmp2))
 
-            # Debug checks for each lane, in their own instructions so they
-            # see the updated v_val.
-            for lane in range(VLEN):
-                self.add(
-                    "debug",
-                    ("compare", v_val + lane, (round, vec_i + lane, "hash_stage", hi)),
-                )
-
         # This method emits instructions directly and returns nothing.
         return None
+
+    # ===== VLIW SCHEDULER HELPERS =====
+
+    def _slot_reads_writes(self, engine, slot):
+        """
+        Compute the sets of scratch locations read and written by a single slot.
+
+        This is conservative: if in doubt we mark an access, which may reduce
+        VLIW packing but will not break correctness.
+        """
+        reads = set()
+        writes = set()
+
+        if engine == "alu":
+            op, dest, a1, a2 = slot
+            writes.add(dest)
+            reads.add(a1)
+            reads.add(a2)
+        elif engine == "valu":
+            op = slot[0]
+            if op == "vbroadcast":
+                _, dest, src = slot
+                writes.update(range(dest, dest + VLEN))
+                reads.add(src)
+            elif op == "multiply_add":
+                _, dest, a, b, c = slot
+                for i in range(VLEN):
+                    writes.add(dest + i)
+                    reads.add(a + i)
+                    reads.add(b + i)
+                    reads.add(c + i)
+            else:
+                # Generic binary vector op
+                _, dest, a1, a2 = slot
+                for i in range(VLEN):
+                    writes.add(dest + i)
+                    reads.add(a1 + i)
+                    reads.add(a2 + i)
+        elif engine == "load":
+            op = slot[0]
+            if op == "load":
+                _, dest, addr = slot
+                writes.add(dest)
+                reads.add(addr)
+            elif op == "load_offset":
+                _, dest, addr, offset = slot
+                writes.add(dest + offset)
+                reads.add(addr + offset)
+            elif op == "vload":
+                _, dest, addr = slot
+                reads.add(addr)
+                writes.update(range(dest, dest + VLEN))
+            elif op == "const":
+                _, dest, _val = slot
+                writes.add(dest)
+        elif engine == "store":
+            op = slot[0]
+            if op == "store":
+                _, addr, src = slot
+                reads.add(addr)
+                reads.add(src)
+            elif op == "vstore":
+                _, addr, src = slot
+                reads.add(addr)
+                for i in range(VLEN):
+                    reads.add(src + i)
+        elif engine == "flow":
+            op = slot[0]
+            if op == "select":
+                _, dest, cond, a, b = slot
+                writes.add(dest)
+                reads.update({cond, a, b})
+            elif op == "add_imm":
+                _, dest, a, _imm = slot
+                writes.add(dest)
+                reads.add(a)
+            elif op == "vselect":
+                _, dest, cond, a, b = slot
+                writes.update(range(dest, dest + VLEN))
+                reads.update(range(cond, cond + VLEN))
+                reads.update(range(a, a + VLEN))
+                reads.update(range(b, b + VLEN))
+            elif op == "coreid":
+                _, dest = slot
+                writes.add(dest)
+            elif op in {"trace_write", "cond_jump", "cond_jump_rel", "jump_indirect"}:
+                # These read a scratch location but don't write one
+                if len(slot) >= 2:
+                    reads.add(slot[1])
+            # halt/pause/jump etc. do not touch scratch; we treat pause as a
+            # barrier separately in the scheduler.
+        return reads, writes
+
+    def _schedule_block(self, ops):
+        """
+        Given a list of ops (each a dict with engine/slot/reads/writes),
+        perform dependency-aware VLIW packing within the block.
+        """
+        n = len(ops)
+        if n == 0:
+            return []
+
+        # Build dependency graph using last-writer and pending-read tracking
+        preds = [set() for _ in range(n)]
+        succs = [set() for _ in range(n)]
+
+        def add_edge(j, i):
+            if j == i:
+                return
+            if j not in preds[i]:
+                preds[i].add(j)
+                succs[j].add(i)
+
+        last_writer = {}
+        from collections import defaultdict
+
+        pending_reads = defaultdict(set)
+
+        for i, op in enumerate(ops):
+            reads = op["reads"]
+            writes = op["writes"]
+
+            # Handle writes: depend on last writer and all pending readers
+            for addr in writes:
+                if addr in last_writer:
+                    add_edge(last_writer[addr], i)
+                if addr in pending_reads:
+                    for j in pending_reads[addr]:
+                        add_edge(j, i)
+                    pending_reads[addr].clear()
+                last_writer[addr] = i
+
+            # Handle reads: depend on last writer
+            for addr in reads:
+                if addr in last_writer:
+                    add_edge(last_writer[addr], i)
+                pending_reads[addr].add(i)
+
+        in_degree = [len(preds[i]) for i in range(n)]
+
+        # Initialize ready list with ops that have no predecessors
+        ready = [i for i in range(n) if in_degree[i] == 0]
+        ready.sort()
+
+        scheduled_instrs = []
+        scheduled_count = 0
+
+        while scheduled_count < n:
+            if not ready:
+                raise RuntimeError("Cycle detected in dependency graph during scheduling")
+
+            bundle = {}
+            used_slots = {engine: 0 for engine in SLOT_LIMITS.keys()}
+            bundle_reads = set()
+            bundle_writes = set()
+
+            next_ready = []
+
+            for i in ready:
+                op = ops[i]
+                engine = op["engine"]
+                slot = op["slot"]
+
+                # Skip if this engine is already full this cycle
+                if used_slots.get(engine, 0) >= SLOT_LIMITS.get(engine, 0):
+                    next_ready.append(i)
+                    continue
+
+                reads = op["reads"]
+                writes = op["writes"]
+
+                # Check for intra-bundle hazards: conservatively forbid any
+                # overlap involving a write.
+                hazard = False
+                if writes & (bundle_reads | bundle_writes):
+                    hazard = True
+                elif reads & bundle_writes:
+                    hazard = True
+
+                if hazard:
+                    next_ready.append(i)
+                    continue
+
+                # Schedule this op in the current bundle
+                bundle.setdefault(engine, []).append(slot)
+                used_slots[engine] = used_slots.get(engine, 0) + 1
+                bundle_reads |= reads
+                bundle_writes |= writes
+                scheduled_count += 1
+
+                # Update in-degrees of successors
+                for j in succs[i]:
+                    in_degree[j] -= 1
+                    if in_degree[j] == 0:
+                        next_ready.append(j)
+
+            scheduled_instrs.append(bundle)
+            # De-duplicate and keep original order as much as possible
+            seen = set()
+            new_ready = []
+            for i in next_ready:
+                if in_degree[i] == 0 and i not in seen:
+                    seen.add(i)
+                    new_ready.append(i)
+            new_ready.sort()
+            ready = new_ready
+
+        return scheduled_instrs
+
+    def schedule_vliw(self):
+        """
+        Run a global, dependency-aware VLIW scheduler over the current
+        instruction stream in self.instrs.
+
+        This flattens the program into individual slots, builds a conservative
+        dependency graph based on scratch reads/writes, and then greedily
+        packs operations into bundles subject to SLOT_LIMITS and dependency
+        constraints.
+        """
+        new_instrs = []
+        current_ops = []
+
+        def flush_block():
+            nonlocal current_ops, new_instrs
+            if current_ops:
+                new_instrs.extend(self._schedule_block(current_ops))
+                current_ops = []
+
+        for instr in self.instrs:
+            # Treat pure pause instructions as barriers: don't schedule across them
+            if "flow" in instr and len(instr) == 1 and len(instr["flow"]) == 1:
+                slot = instr["flow"][0]
+                if slot[0] == "pause":
+                    flush_block()
+                    new_instrs.append(instr)
+                    continue
+
+            # Flatten non-debug slots into current_ops
+            for engine, slots in instr.items():
+                if engine == "debug":
+                    # We currently never emit debug instructions, but keep this
+                    # for robustness: treat debug as a barrier.
+                    flush_block()
+                    new_instrs.append({engine: list(slots)})
+                    continue
+                for slot in slots:
+                    reads, writes = self._slot_reads_writes(engine, slot)
+                    current_ops.append(
+                        {"engine": engine, "slot": slot, "reads": reads, "writes": writes}
+                    )
+
+        flush_block()
+        self.instrs = new_instrs
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -247,8 +492,9 @@ class KernelBuilder:
         s_tree_addr = self.alloc_scratch("s_tree_addr")
         s_node_val = self.alloc_scratch("s_node_val")
         
-        # Address calculation temporaries
-        addr_base = self.alloc_scratch("addr_base")
+        # Address calculation temporaries for input indices/values
+        addr_idx_base = self.alloc_scratch("addr_idx_base")
+        addr_val_base = self.alloc_scratch("addr_val_base")
         
         # Pre-compute constants broadcast vectors
         v_zero = self.alloc_scratch("v_zero", VLEN)
@@ -263,6 +509,11 @@ class KernelBuilder:
         # Broadcast n_nodes for bounds checking
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
         self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
+        
+        # Vectorized base address for forest values: broadcast once, then reuse
+        v_tree_addr = self.alloc_scratch("v_tree_addr", VLEN)
+        v_forest_base = self.alloc_scratch("v_forest_base", VLEN)
+        self.add("valu", ("vbroadcast", v_forest_base, self.scratch["forest_values_p"]))
 
         # ===== HASH CONSTANT VECTORS (PRECOMPUTED ONCE) =====
         self.hash_stage_kind = []
@@ -315,42 +566,45 @@ class KernelBuilder:
                 # ===== PHASE 1: LOAD BATCH DATA (VECTORIZED) =====
                 # Load 8 indices and 8 values in parallel using vector loads
                 
-                # Calculate base address for this vector batch
+                # Calculate base addresses for this vector batch
                 vec_offset = vec_i
+                vec_offset_const = self.scratch_const(vec_offset)
                 
-                # Build instruction bundle for parallel loads
-                # Load indices and values in same cycle (2 load slots)
-                load_bundle = {
+                # First instruction: compute both base addresses (indices and values)
+                addr_bundle = {
                     "alu": [
-                        ("+", addr_base, self.scratch["inp_indices_p"], self.scratch_const(vec_offset)),
-                    ],
-                    "load": []
+                        ("+", addr_idx_base, self.scratch["inp_indices_p"], vec_offset_const),
+                        ("+", addr_val_base, self.scratch["inp_values_p"], vec_offset_const),
+                    ]
+                }
+                self.add_bundle(addr_bundle)
+                
+                # Second instruction: vload indices and values in the same cycle
+                load_bundle = {
+                    "load": [
+                        ("vload", v_idx, addr_idx_base),
+                        ("vload", v_val, addr_val_base),
+                    ]
                 }
                 self.add_bundle(load_bundle)
                 
-                # vload indices
-                self.add("load", ("vload", v_idx, addr_base))
+                # ===== PHASE 2: LOAD TREE NODES (SCATTERED ACCESS, VECTORIZED ADDRS) =====
+                # Build vector of addresses forest_values_p + v_idx and then issue 8 loads
+                # using load_offset. We pack 2 loads per cycle via add_bundle, saturating
+                # the 2 load slots and reducing this phase to ~4-5 cycles.
                 
-                # Calculate and load values
-                self.add("alu", ("+", addr_base, self.scratch["inp_values_p"], self.scratch_const(vec_offset)))
-                self.add("load", ("vload", v_val, addr_base))
+                # Compute per-lane addresses: v_tree_addr = v_forest_base + v_idx
+                self.add("valu", ("+", v_tree_addr, v_forest_base, v_idx))
                 
-                # Debug: verify loaded indices and values
-                for lane in range(VLEN):
-                    self.add("debug", ("compare", v_idx + lane, (round_idx, vec_i + lane, "idx")))
-                for lane in range(VLEN):
-                    self.add("debug", ("compare", v_val + lane, (round_idx, vec_i + lane, "val")))
-                
-                # ===== PHASE 2: LOAD TREE NODES (SCATTERED ACCESS) =====
-                # Each of 8 lanes has different index, requires 8 scalar loads
-                # Use both load slots to load 2 nodes per cycle = 4 cycles total
-                
-                for lane in range(VLEN):
-                    # Load tree_values[v_idx[lane]] into v_node_val[lane]
-                    # This is a gather operation: each lane has different address
-                    self.add("alu", ("+", s_tree_addr, self.scratch["forest_values_p"], v_idx + lane))
-                    self.add("load", ("load", v_node_val + lane, s_tree_addr))
-                    self.add("debug", ("compare", v_node_val + lane, (round_idx, vec_i + lane, "node_val")))
+                # Load 8 tree node values using load_offset, 2 loads per instruction
+                for lane_pair_start in range(0, VLEN, 2):
+                    bundle = {
+                        "load": [
+                            ("load_offset", v_node_val, v_tree_addr, lane_pair_start),
+                            ("load_offset", v_node_val, v_tree_addr, lane_pair_start + 1),
+                        ]
+                    }
+                    self.add_bundle(bundle)
                 
                 # ===== PHASE 3: XOR WITH TREE VALUES =====
                 # Vector XOR: v_val[i] ^= v_node_val[i] for all i in 0..7
@@ -362,10 +616,6 @@ class KernelBuilder:
                 self.build_hash_vectorized(
                     v_val, v_tmp1, v_tmp2, v_tmp3, round_idx, vec_i
                 )
-                
-                # Debug: verify hashed values
-                for lane in range(VLEN):
-                    self.add("debug", ("compare", v_val + lane, (round_idx, vec_i + lane, "hashed_val")))
                 
                 # ===== PHASE 5: COMPUTE NEXT INDEX =====
                 # idx = 2*idx + (1 if val%2==0 else 2)
@@ -380,31 +630,30 @@ class KernelBuilder:
                 # Calculate next_idx = 2*idx + offset using vector multiply_add
                 self.add("valu", ("multiply_add", v_next_idx, v_idx, v_two, v_tmp2))
                 
-                # Debug: verify next index
-                for lane in range(VLEN):
-                    self.add("debug", ("compare", v_next_idx + lane, (round_idx, vec_i + lane, "next_idx")))
-                
                 # ===== PHASE 6: WRAP INDEX (BOUNDS CHECK) =====
                 # idx = 0 if idx >= n_nodes else idx
                 self.add("valu", ("<", v_in_bounds, v_next_idx, v_n_nodes))
                 self.add("flow", ("vselect", v_idx, v_in_bounds, v_next_idx, v_zero))
                 
-                # Debug: verify wrapped index
-                for lane in range(VLEN):
-                    self.add("debug", ("compare", v_idx + lane, (round_idx, vec_i + lane, "wrapped_idx")))
-                
                 # ===== PHASE 7: STORE RESULTS (VECTORIZED) =====
-                # Store 8 indices and 8 values back to memory
-                # Use both store slots for parallel writes
+                # Store 8 indices and 8 values back to memory using the same
+                # base addresses computed in PHASE 1. Use both store slots
+                # for parallel writes.
                 
-                self.add("alu", ("+", addr_base, self.scratch["inp_indices_p"], self.scratch_const(vec_offset)))
-                self.add("store", ("vstore", addr_base, v_idx))
-                
-                self.add("alu", ("+", addr_base, self.scratch["inp_values_p"], self.scratch_const(vec_offset)))
-                self.add("store", ("vstore", addr_base, v_val))
+                store_bundle = {
+                    "store": [
+                        ("vstore", addr_idx_base, v_idx),
+                        ("vstore", addr_val_base, v_val),
+                    ]
+                }
+                self.add_bundle(store_bundle)
         
         # Match the pause in reference implementation
         self.add("flow", ("pause",))
+
+        # After building the kernel, globally VLIW-pack the instruction stream
+        # using a conservative, dependency-aware scheduler.
+        self.schedule_vliw()
 
 
 BASELINE = 147734

@@ -498,6 +498,27 @@ class KernelBuilder:
         v_next_idx_b = self.alloc_scratch("v_next_idx_b", VLEN)
         v_is_even_b = self.alloc_scratch("v_is_even_b", VLEN)
         v_in_bounds_b = self.alloc_scratch("v_in_bounds_b", VLEN)
+
+        # Third and fourth sets for more ILP (4-way unrolling)
+        v_idx_c = self.alloc_scratch("v_idx_c", VLEN)
+        v_val_c = self.alloc_scratch("v_val_c", VLEN)
+        v_node_val_c = self.alloc_scratch("v_node_val_c", VLEN)
+        v_tmp1_c = self.alloc_scratch("v_tmp1_c", VLEN)
+        v_tmp2_c = self.alloc_scratch("v_tmp2_c", VLEN)
+        v_tmp3_c = self.alloc_scratch("v_tmp3_c", VLEN)
+        v_next_idx_c = self.alloc_scratch("v_next_idx_c", VLEN)
+        v_is_even_c = self.alloc_scratch("v_is_even_c", VLEN)
+        v_in_bounds_c = self.alloc_scratch("v_in_bounds_c", VLEN)
+
+        v_idx_d = self.alloc_scratch("v_idx_d", VLEN)
+        v_val_d = self.alloc_scratch("v_val_d", VLEN)
+        v_node_val_d = self.alloc_scratch("v_node_val_d", VLEN)
+        v_tmp1_d = self.alloc_scratch("v_tmp1_d", VLEN)
+        v_tmp2_d = self.alloc_scratch("v_tmp2_d", VLEN)
+        v_tmp3_d = self.alloc_scratch("v_tmp3_d", VLEN)
+        v_next_idx_d = self.alloc_scratch("v_next_idx_d", VLEN)
+        v_is_even_d = self.alloc_scratch("v_is_even_d", VLEN)
+        v_in_bounds_d = self.alloc_scratch("v_in_bounds_d", VLEN)
         
         # Scalar temps for tree node loading
         s_tree_idx = self.alloc_scratch("s_tree_idx")
@@ -525,6 +546,8 @@ class KernelBuilder:
         # Vectorized base address for forest values: broadcast once, then reuse
         v_tree_addr = self.alloc_scratch("v_tree_addr", VLEN)
         v_tree_addr_b = self.alloc_scratch("v_tree_addr_b", VLEN)
+        v_tree_addr_c = self.alloc_scratch("v_tree_addr_c", VLEN)
+        v_tree_addr_d = self.alloc_scratch("v_tree_addr_d", VLEN)
         v_forest_base = self.alloc_scratch("v_forest_base", VLEN)
         self.add("valu", ("vbroadcast", v_forest_base, self.scratch["forest_values_p"]))
 
@@ -600,15 +623,20 @@ class KernelBuilder:
                 ("vload", s_val_base + vec_i, addr_val_base),
             )
         
-        # ===== MAIN VECTORIZED LOOP (STATE IN SCRATCH, UNROLLED BY 2) =====
-        # Process batch_size items in groups of 2 * VLEN. For each pair of
-        # vectors we maintain independent working registers (a and b), which
+        # ===== MAIN VECTORIZED LOOP (STATE IN SCRATCH, UNROLLED BY 4) =====
+        # Process batch_size items in groups of 4 * VLEN. For each group of
+        # four vectors we maintain independent working registers (A–D), which
         # exposes more instruction-level parallelism for the global VLIW
         # scheduler to exploit.
+        #
+        # NOTE: This assumes batch_size is a multiple of 4 * VLEN (which holds
+        # for the submission tests where batch_size=256 and VLEN=8).
         for round_idx in range(rounds):
-            for vec_i in range(0, batch_size, VLEN * 2):
+            for vec_i in range(0, batch_size, VLEN * 4):
                 vec_i0 = vec_i
                 vec_i1 = vec_i + VLEN
+                vec_i2 = vec_i + 2 * VLEN
+                vec_i3 = vec_i + 3 * VLEN
 
                 # ===== PHASE 1: LOAD BATCH DATA FROM SCRATCH (NO MEMORY) =====
                 # Group A
@@ -629,10 +657,26 @@ class KernelBuilder:
                     "valu",
                     ("+", v_val_b, s_val_base + vec_i1, v_zero),
                 )
+                # Group C
+                self.add(
+                    "valu",
+                    ("+", v_idx_c, s_idx_base + vec_i2, v_zero),
+                )
+                self.add(
+                    "valu",
+                    ("+", v_val_c, s_val_base + vec_i2, v_zero),
+                )
+                # Group D
+                self.add(
+                    "valu",
+                    ("+", v_idx_d, s_idx_base + vec_i3, v_zero),
+                )
+                self.add(
+                    "valu",
+                    ("+", v_val_d, s_val_base + vec_i3, v_zero),
+                )
 
                 # ===== PHASES 2–6 FOR GROUP A =====
-                # Build vector of addresses forest_values_p + v_idx and then issue 8 loads
-                # using load_offset.
                 self.add("valu", ("+", v_tree_addr, v_forest_base, v_idx))
                 for lane_pair_start in range(0, VLEN, 2):
                     bundle = {
@@ -643,15 +687,12 @@ class KernelBuilder:
                     }
                     self.add_bundle(bundle)
 
-                # XOR with tree values
                 self.add("valu", ("^", v_val, v_val, v_node_val))
 
-                # Hash
                 self.build_hash_vectorized(
                     v_val, v_tmp1, v_tmp2, v_tmp3, round_idx, vec_i0
                 )
 
-                # Compute next index
                 self.add("valu", ("%", v_tmp1, v_val, v_two))
                 self.add("valu", ("==", v_is_even, v_tmp1, v_zero))
                 self.add("flow", ("vselect", v_tmp2, v_is_even, v_one, v_two))
@@ -683,9 +724,55 @@ class KernelBuilder:
                 self.add("valu", ("<", v_in_bounds_b, v_next_idx_b, v_n_nodes))
                 self.add("flow", ("vselect", v_idx_b, v_in_bounds_b, v_next_idx_b, v_zero))
 
+                # ===== PHASES 2–6 FOR GROUP C =====
+                self.add("valu", ("+", v_tree_addr_c, v_forest_base, v_idx_c))
+                for lane_pair_start in range(0, VLEN, 2):
+                    bundle = {
+                        "load": [
+                            ("load_offset", v_node_val_c, v_tree_addr_c, lane_pair_start),
+                            ("load_offset", v_node_val_c, v_tree_addr_c, lane_pair_start + 1),
+                        ]
+                    }
+                    self.add_bundle(bundle)
+
+                self.add("valu", ("^", v_val_c, v_val_c, v_node_val_c))
+
+                self.build_hash_vectorized(
+                    v_val_c, v_tmp1_c, v_tmp2_c, v_tmp3_c, round_idx, vec_i2
+                )
+
+                self.add("valu", ("%", v_tmp1_c, v_val_c, v_two))
+                self.add("valu", ("==", v_is_even_c, v_tmp1_c, v_zero))
+                self.add("flow", ("vselect", v_tmp2_c, v_is_even_c, v_one, v_two))
+                self.add("valu", ("multiply_add", v_next_idx_c, v_idx_c, v_two, v_tmp2_c))
+                self.add("valu", ("<", v_in_bounds_c, v_next_idx_c, v_n_nodes))
+                self.add("flow", ("vselect", v_idx_c, v_in_bounds_c, v_next_idx_c, v_zero))
+
+                # ===== PHASES 2–6 FOR GROUP D =====
+                self.add("valu", ("+", v_tree_addr_d, v_forest_base, v_idx_d))
+                for lane_pair_start in range(0, VLEN, 2):
+                    bundle = {
+                        "load": [
+                            ("load_offset", v_node_val_d, v_tree_addr_d, lane_pair_start),
+                            ("load_offset", v_node_val_d, v_tree_addr_d, lane_pair_start + 1),
+                        ]
+                    }
+                    self.add_bundle(bundle)
+
+                self.add("valu", ("^", v_val_d, v_val_d, v_node_val_d))
+
+                self.build_hash_vectorized(
+                    v_val_d, v_tmp1_d, v_tmp2_d, v_tmp3_d, round_idx, vec_i3
+                )
+
+                self.add("valu", ("%", v_tmp1_d, v_val_d, v_two))
+                self.add("valu", ("==", v_is_even_d, v_tmp1_d, v_zero))
+                self.add("flow", ("vselect", v_tmp2_d, v_is_even_d, v_one, v_two))
+                self.add("valu", ("multiply_add", v_next_idx_d, v_idx_d, v_two, v_tmp2_d))
+                self.add("valu", ("<", v_in_bounds_d, v_next_idx_d, v_n_nodes))
+                self.add("flow", ("vselect", v_idx_d, v_in_bounds_d, v_next_idx_d, v_zero))
+
                 # ===== PHASE 7: STORE RESULTS BACK INTO SCRATCH (VECTORIZED) =====
-                # Write updated indices and values for both groups back to the scratch
-                # arrays so the next round starts from the new state.
                 self.add(
                     "valu",
                     ("+", s_idx_base + vec_i0, v_idx, v_zero),
@@ -701,6 +788,22 @@ class KernelBuilder:
                 self.add(
                     "valu",
                     ("+", s_val_base + vec_i1, v_val_b, v_zero),
+                )
+                self.add(
+                    "valu",
+                    ("+", s_idx_base + vec_i2, v_idx_c, v_zero),
+                )
+                self.add(
+                    "valu",
+                    ("+", s_val_base + vec_i2, v_val_c, v_zero),
+                )
+                self.add(
+                    "valu",
+                    ("+", s_idx_base + vec_i3, v_idx_d, v_zero),
+                )
+                self.add(
+                    "valu",
+                    ("+", s_val_base + vec_i3, v_val_d, v_zero),
                 )
 
         # ===== WRITE FINAL RESULTS BACK TO MEMORY =====

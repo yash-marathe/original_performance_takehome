@@ -296,9 +296,12 @@ class KernelBuilder:
         batch_v_idx = [self.alloc_scratch(f"batch_idx_{i}", VLEN) for i in range(num_batches)]
         batch_v_val = [self.alloc_scratch(f"batch_val_{i}", VLEN) for i in range(num_batches)]
         
+        # Allocate multiple v_node_val arrays for interleaving
+        INTERLEAVE_FACTOR = min(4, num_batches)
+        v_node_vals = [self.alloc_scratch(f"v_node_val_{i}", VLEN) for i in range(INTERLEAVE_FACTOR)]
+        v_addrs = [self.alloc_scratch(f"v_addr_{i}", VLEN) for i in range(INTERLEAVE_FACTOR)]
+        
         # Working registers
-        v_node_val = self.alloc_scratch("v_node_val", VLEN)
-        v_addr = self.alloc_scratch("v_addr", VLEN)
         v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
         v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
         
@@ -335,38 +338,53 @@ class KernelBuilder:
             body.append(("alu", ("+", s_base_addr, self.scratch["inp_values_p"], batch_offset)))
             body.append(("load", ("vload", batch_v_val[batch_idx], s_base_addr)))
         
-        # Main computation - all data stays in vector registers!
+        # Main computation - Process multiple batches in an interleaved fashion to maximize ILP
         for round in range(rounds):
-            for batch_idx in range(num_batches):
-                v_idx = batch_v_idx[batch_idx]
-                v_val = batch_v_val[batch_idx]
+            for batch_group in range(0, num_batches, INTERLEAVE_FACTOR):
+                group_size = min(INTERLEAVE_FACTOR, num_batches - batch_group)
                 
-                # Load node values (only memory access in inner loop)
+                # Interleave address computation and loads for all batches in group
                 for vi in range(VLEN):
-                    body.append(("alu", ("+", v_addr + vi, self.scratch["forest_values_p"], v_idx + vi)))
-                    body.append(("load", ("load", v_node_val + vi, v_addr + vi)))
+                    for b_offset in range(group_size):
+                        batch_idx = batch_group + b_offset
+                        v_idx = batch_v_idx[batch_idx]
+                        v_addr = v_addrs[b_offset]
+                        body.append(("alu", ("+", v_addr + vi, self.scratch["forest_values_p"], v_idx + vi)))
                 
-                # XOR
-                body.append(("valu", ("^", v_val, v_val, v_node_val)))
-                
-                # Hash
-                for hi, (vc1, vc3) in enumerate(v_hash_consts):
-                    op1, val1, op2, op3, val3 = HASH_STAGES[hi]
-                    body.append(("valu", (op1, v_tmp1, v_val, vc1)))
-                    body.append(("valu", (op3, v_tmp2, v_val, vc3)))
-                    body.append(("valu", (op2, v_val, v_tmp1, v_tmp2)))
-                
-                # Next index
-                body.append(("valu", ("&", v_tmp2, v_val, v_one)))
-                body.append(("valu", ("==", v_tmp2, v_tmp2, v_zero)))
-                body.append(("flow", ("vselect", v_tmp2, v_tmp2, v_one, v_two)))
-                body.append(("valu", ("*", v_idx, v_idx, v_two)))
-                body.append(("valu", ("+", v_idx, v_idx, v_tmp2)))
-                
-                # Wrap
                 for vi in range(VLEN):
-                    body.append(("alu", ("<", v_tmp1 + vi, v_idx + vi, self.scratch["n_nodes"])))
-                    body.append(("flow", ("select", v_idx + vi, v_tmp1 + vi, v_idx + vi, zero_const)))
+                    for b_offset in range(group_size):
+                        v_addr = v_addrs[b_offset]
+                        v_node_val = v_node_vals[b_offset]
+                        body.append(("load", ("load", v_node_val + vi, v_addr + vi)))
+                
+                # Process each batch in the group
+                for b_offset in range(group_size):
+                    batch_idx = batch_group + b_offset
+                    v_idx = batch_v_idx[batch_idx]
+                    v_val = batch_v_val[batch_idx]
+                    v_node_val = v_node_vals[b_offset]
+                    
+                    # XOR
+                    body.append(("valu", ("^", v_val, v_val, v_node_val)))
+                    
+                    # Hash
+                    for hi, (vc1, vc3) in enumerate(v_hash_consts):
+                        op1, val1, op2, op3, val3 = HASH_STAGES[hi]
+                        body.append(("valu", (op1, v_tmp1, v_val, vc1)))
+                        body.append(("valu", (op3, v_tmp2, v_val, vc3)))
+                        body.append(("valu", (op2, v_val, v_tmp1, v_tmp2)))
+                    
+                    # Next index
+                    body.append(("valu", ("&", v_tmp2, v_val, v_one)))
+                    body.append(("valu", ("==", v_tmp2, v_tmp2, v_zero)))
+                    body.append(("flow", ("vselect", v_tmp2, v_tmp2, v_one, v_two)))
+                    body.append(("valu", ("<<", v_idx, v_idx, v_one)))
+                    body.append(("valu", ("+", v_idx, v_idx, v_tmp2)))
+                    
+                    # Wrap
+                    for vi in range(VLEN):
+                        body.append(("alu", ("<", v_tmp1 + vi, v_idx + vi, self.scratch["n_nodes"])))
+                        body.append(("flow", ("select", v_idx + vi, v_tmp1 + vi, v_idx + vi, zero_const)))
         
         # Write all results back to memory at the end
         for batch_idx in range(num_batches):

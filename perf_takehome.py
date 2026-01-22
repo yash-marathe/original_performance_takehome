@@ -477,6 +477,7 @@ class KernelBuilder:
         two_const = self.scratch_const(2)
         
         # ===== VECTOR SCRATCH ALLOCATION (8 words each for VLEN=8) =====
+        # Primary vector registers
         v_idx = self.alloc_scratch("v_idx", VLEN)           # Current indices (8 items)
         v_val = self.alloc_scratch("v_val", VLEN)           # Current values (8 items)
         v_node_val = self.alloc_scratch("v_node_val", VLEN) # Tree node values (8 items)
@@ -486,6 +487,17 @@ class KernelBuilder:
         v_next_idx = self.alloc_scratch("v_next_idx", VLEN) # Next iteration indices
         v_is_even = self.alloc_scratch("v_is_even", VLEN)   # Evenness mask for branching
         v_in_bounds = self.alloc_scratch("v_in_bounds", VLEN) # Bounds check mask
+
+        # Second set of vector registers for software pipelining / unrolling
+        v_idx_b = self.alloc_scratch("v_idx_b", VLEN)
+        v_val_b = self.alloc_scratch("v_val_b", VLEN)
+        v_node_val_b = self.alloc_scratch("v_node_val_b", VLEN)
+        v_tmp1_b = self.alloc_scratch("v_tmp1_b", VLEN)
+        v_tmp2_b = self.alloc_scratch("v_tmp2_b", VLEN)
+        v_tmp3_b = self.alloc_scratch("v_tmp3_b", VLEN)
+        v_next_idx_b = self.alloc_scratch("v_next_idx_b", VLEN)
+        v_is_even_b = self.alloc_scratch("v_is_even_b", VLEN)
+        v_in_bounds_b = self.alloc_scratch("v_in_bounds_b", VLEN)
         
         # Scalar temps for tree node loading
         s_tree_idx = self.alloc_scratch("s_tree_idx")
@@ -512,6 +524,7 @@ class KernelBuilder:
         
         # Vectorized base address for forest values: broadcast once, then reuse
         v_tree_addr = self.alloc_scratch("v_tree_addr", VLEN)
+        v_tree_addr_b = self.alloc_scratch("v_tree_addr_b", VLEN)
         v_forest_base = self.alloc_scratch("v_forest_base", VLEN)
         self.add("valu", ("vbroadcast", v_forest_base, self.scratch["forest_values_p"]))
 
@@ -556,47 +569,71 @@ class KernelBuilder:
                 self.hash_ops[hi] = (op1, op2, op3)
 
         self.add("flow", ("pause",))
+
+        # ===== PRELOAD INPUT INDICES / VALUES INTO SCRATCH =====
+        # Copy the initial indices and values from memory into scratch-backed
+        # arrays. The main loop will then operate entirely out of scratch, and
+        # we only write the final results back to memory once at the end.
+        s_idx_base = self.alloc_scratch("s_idx", batch_size)
+        s_val_base = self.alloc_scratch("s_val", batch_size)
+
+        for vec_i in range(0, batch_size, VLEN):
+            vec_offset_const = self.scratch_const(vec_i)
+
+            # Load indices into scratch: s_idx_base[vec_i:vec_i+VLEN]
+            self.add(
+                "alu",
+                ("+", addr_idx_base, self.scratch["inp_indices_p"], vec_offset_const),
+            )
+            self.add(
+                "load",
+                ("vload", s_idx_base + vec_i, addr_idx_base),
+            )
+
+            # Load values into scratch: s_val_base[vec_i:vec_i+VLEN]
+            self.add(
+                "alu",
+                ("+", addr_val_base, self.scratch["inp_values_p"], vec_offset_const),
+            )
+            self.add(
+                "load",
+                ("vload", s_val_base + vec_i, addr_val_base),
+            )
         
-        # ===== MAIN VECTORIZED LOOP =====
-        # Process batch_size items in groups of VLEN (8)
-        # Instead of 256 iterations, we have 32 iterations (256/8)
-        
+        # ===== MAIN VECTORIZED LOOP (STATE IN SCRATCH, UNROLLED BY 2) =====
+        # Process batch_size items in groups of 2 * VLEN. For each pair of
+        # vectors we maintain independent working registers (a and b), which
+        # exposes more instruction-level parallelism for the global VLIW
+        # scheduler to exploit.
         for round_idx in range(rounds):
-            for vec_i in range(0, batch_size, VLEN):
-                # ===== PHASE 1: LOAD BATCH DATA (VECTORIZED) =====
-                # Load 8 indices and 8 values in parallel using vector loads
-                
-                # Calculate base addresses for this vector batch
-                vec_offset = vec_i
-                vec_offset_const = self.scratch_const(vec_offset)
-                
-                # First instruction: compute both base addresses (indices and values)
-                addr_bundle = {
-                    "alu": [
-                        ("+", addr_idx_base, self.scratch["inp_indices_p"], vec_offset_const),
-                        ("+", addr_val_base, self.scratch["inp_values_p"], vec_offset_const),
-                    ]
-                }
-                self.add_bundle(addr_bundle)
-                
-                # Second instruction: vload indices and values in the same cycle
-                load_bundle = {
-                    "load": [
-                        ("vload", v_idx, addr_idx_base),
-                        ("vload", v_val, addr_val_base),
-                    ]
-                }
-                self.add_bundle(load_bundle)
-                
-                # ===== PHASE 2: LOAD TREE NODES (SCATTERED ACCESS, VECTORIZED ADDRS) =====
+            for vec_i in range(0, batch_size, VLEN * 2):
+                vec_i0 = vec_i
+                vec_i1 = vec_i + VLEN
+
+                # ===== PHASE 1: LOAD BATCH DATA FROM SCRATCH (NO MEMORY) =====
+                # Group A
+                self.add(
+                    "valu",
+                    ("+", v_idx, s_idx_base + vec_i0, v_zero),
+                )
+                self.add(
+                    "valu",
+                    ("+", v_val, s_val_base + vec_i0, v_zero),
+                )
+                # Group B
+                self.add(
+                    "valu",
+                    ("+", v_idx_b, s_idx_base + vec_i1, v_zero),
+                )
+                self.add(
+                    "valu",
+                    ("+", v_val_b, s_val_base + vec_i1, v_zero),
+                )
+
+                # ===== PHASES 2–6 FOR GROUP A =====
                 # Build vector of addresses forest_values_p + v_idx and then issue 8 loads
-                # using load_offset. We pack 2 loads per cycle via add_bundle, saturating
-                # the 2 load slots and reducing this phase to ~4-5 cycles.
-                
-                # Compute per-lane addresses: v_tree_addr = v_forest_base + v_idx
+                # using load_offset.
                 self.add("valu", ("+", v_tree_addr, v_forest_base, v_idx))
-                
-                # Load 8 tree node values using load_offset, 2 loads per instruction
                 for lane_pair_start in range(0, VLEN, 2):
                     bundle = {
                         "load": [
@@ -605,48 +642,90 @@ class KernelBuilder:
                         ]
                     }
                     self.add_bundle(bundle)
-                
-                # ===== PHASE 3: XOR WITH TREE VALUES =====
-                # Vector XOR: v_val[i] ^= v_node_val[i] for all i in 0..7
+
+                # XOR with tree values
                 self.add("valu", ("^", v_val, v_val, v_node_val))
-                
-                # ===== PHASE 4: HASH FUNCTION (6 STAGES, VECTORIZED) =====
-                # Each stage processes all 8 lanes in parallel.
-                # The helper emits instructions directly into self.instrs.
+
+                # Hash
                 self.build_hash_vectorized(
-                    v_val, v_tmp1, v_tmp2, v_tmp3, round_idx, vec_i
+                    v_val, v_tmp1, v_tmp2, v_tmp3, round_idx, vec_i0
                 )
-                
-                # ===== PHASE 5: COMPUTE NEXT INDEX =====
-                # idx = 2*idx + (1 if val%2==0 else 2)
-                
-                # Check if value is even: (val % 2) == 0
+
+                # Compute next index
                 self.add("valu", ("%", v_tmp1, v_val, v_two))
                 self.add("valu", ("==", v_is_even, v_tmp1, v_zero))
-                
-                # Select offset: 1 if even, 2 if odd
                 self.add("flow", ("vselect", v_tmp2, v_is_even, v_one, v_two))
-                
-                # Calculate next_idx = 2*idx + offset using vector multiply_add
                 self.add("valu", ("multiply_add", v_next_idx, v_idx, v_two, v_tmp2))
-                
-                # ===== PHASE 6: WRAP INDEX (BOUNDS CHECK) =====
-                # idx = 0 if idx >= n_nodes else idx
                 self.add("valu", ("<", v_in_bounds, v_next_idx, v_n_nodes))
                 self.add("flow", ("vselect", v_idx, v_in_bounds, v_next_idx, v_zero))
-                
-                # ===== PHASE 7: STORE RESULTS (VECTORIZED) =====
-                # Store 8 indices and 8 values back to memory using the same
-                # base addresses computed in PHASE 1. Use both store slots
-                # for parallel writes.
-                
-                store_bundle = {
-                    "store": [
-                        ("vstore", addr_idx_base, v_idx),
-                        ("vstore", addr_val_base, v_val),
-                    ]
-                }
-                self.add_bundle(store_bundle)
+
+                # ===== PHASES 2–6 FOR GROUP B =====
+                self.add("valu", ("+", v_tree_addr_b, v_forest_base, v_idx_b))
+                for lane_pair_start in range(0, VLEN, 2):
+                    bundle = {
+                        "load": [
+                            ("load_offset", v_node_val_b, v_tree_addr_b, lane_pair_start),
+                            ("load_offset", v_node_val_b, v_tree_addr_b, lane_pair_start + 1),
+                        ]
+                    }
+                    self.add_bundle(bundle)
+
+                self.add("valu", ("^", v_val_b, v_val_b, v_node_val_b))
+
+                self.build_hash_vectorized(
+                    v_val_b, v_tmp1_b, v_tmp2_b, v_tmp3_b, round_idx, vec_i1
+                )
+
+                self.add("valu", ("%", v_tmp1_b, v_val_b, v_two))
+                self.add("valu", ("==", v_is_even_b, v_tmp1_b, v_zero))
+                self.add("flow", ("vselect", v_tmp2_b, v_is_even_b, v_one, v_two))
+                self.add("valu", ("multiply_add", v_next_idx_b, v_idx_b, v_two, v_tmp2_b))
+                self.add("valu", ("<", v_in_bounds_b, v_next_idx_b, v_n_nodes))
+                self.add("flow", ("vselect", v_idx_b, v_in_bounds_b, v_next_idx_b, v_zero))
+
+                # ===== PHASE 7: STORE RESULTS BACK INTO SCRATCH (VECTORIZED) =====
+                # Write updated indices and values for both groups back to the scratch
+                # arrays so the next round starts from the new state.
+                self.add(
+                    "valu",
+                    ("+", s_idx_base + vec_i0, v_idx, v_zero),
+                )
+                self.add(
+                    "valu",
+                    ("+", s_val_base + vec_i0, v_val, v_zero),
+                )
+                self.add(
+                    "valu",
+                    ("+", s_idx_base + vec_i1, v_idx_b, v_zero),
+                )
+                self.add(
+                    "valu",
+                    ("+", s_val_base + vec_i1, v_val_b, v_zero),
+                )
+
+        # ===== WRITE FINAL RESULTS BACK TO MEMORY =====
+        # After all rounds, copy the scratch-backed indices and values back to
+        # the input arrays in memory in vector chunks.
+        for vec_i in range(0, batch_size, VLEN):
+            vec_offset_const = self.scratch_const(vec_i)
+
+            self.add(
+                "alu",
+                ("+", addr_idx_base, self.scratch["inp_indices_p"], vec_offset_const),
+            )
+            self.add(
+                "store",
+                ("vstore", addr_idx_base, s_idx_base + vec_i),
+            )
+
+            self.add(
+                "alu",
+                ("+", addr_val_base, self.scratch["inp_values_p"], vec_offset_const),
+            )
+            self.add(
+                "store",
+                ("vstore", addr_val_base, s_val_base + vec_i),
+            )
         
         # Match the pause in reference implementation
         self.add("flow", ("pause",))

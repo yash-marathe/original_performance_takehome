@@ -458,23 +458,32 @@ class KernelBuilder:
         # Allocate scalar temporaries
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
         
-        # Load initial configuration from memory
-        init_vars = [
-            "rounds", "n_nodes", "batch_size", "forest_height",
-            "forest_values_p", "inp_indices_p", "inp_values_p"
-        ]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
-        
-        # Allocate constants
+        # Allocate commonly used scalar constants early
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
+        
+        # Load initial configuration from memory (rounds, sizes, base pointers)
+        init_vars = [
+            "rounds",
+            "n_nodes",
+            "batch_size",
+            "forest_height",
+            "forest_values_p",
+            "inp_indices_p",
+            "inp_values_p",
+        ]
+        for v in init_vars:
+            self.alloc_scratch(v, 1)
+        # Load header[0..len(init_vars)-1] in a single vector load,
+        # then copy into the per-variable scalar slots.
+        v_header = self.alloc_scratch("v_header", len(init_vars))
+        # Header fields are stored at mem[0..], and zero_const holds 0.
+        self.add("load", ("vload", v_header, zero_const))
+        for i, v in enumerate(init_vars):
+            # Copy header value into the named scalar slot
+            self.add("alu", ("+", self.scratch[v], v_header + i, zero_const))
         
         # ===== VECTOR SCRATCH ALLOCATION (8 words each for VLEN=8) =====
         # Primary vector registers

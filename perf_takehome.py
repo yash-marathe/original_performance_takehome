@@ -45,6 +45,14 @@ class KernelBuilder:
         self.scratch_ptr = 0
         self.const_map = {}
 
+        # Hash optimization metadata, initialized in build_kernel
+        self.hash_stage_kind = []
+        self.hash_mul_vec = {}
+        self.hash_add_vec = {}
+        self.hash_op1_const = {}
+        self.hash_shift_const = {}
+        self.hash_ops = {}
+
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
@@ -125,30 +133,51 @@ class KernelBuilder:
 
     def build_hash_vectorized(self, v_val, v_tmp1, v_tmp2, v_tmp3, round, vec_i):
         """
-        OPTIMIZED: Vectorized hash function that processes 8 values in parallel.
-        Uses valu operations and broadcasts constants to all lanes.
-        Each hash stage operates on all 8 vector lanes simultaneously.
+        Vectorized hash function that processes 8 values in parallel.
+
+        Uses a mix of generic 3-op stages and optimized multiply_add stages
+        for those of the form:
+
+            a = (a + C1) + (a << k)
+
+        which can be rewritten as:
+
+            a = a * (1 + 2**k) + C1   (mod 2**32)
+
+        The per-stage metadata (kind and pre-broadcasted constant vectors) is
+        prepared once in build_kernel.
         """
-        slots = []
-        
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            # Broadcast constants to vector registers
-            const1_addr = self.scratch_const(val1)
-            const3_addr = self.scratch_const(val3)
-            
-            # All three operations have dependencies, so they must be sequential
-            # But we can add other independent operations in the same bundles
-            slots.append(("valu", ("vbroadcast", v_tmp3, const1_addr)))
-            slots.append(("valu", (op1, v_tmp1, v_val, v_tmp3)))
-            slots.append(("valu", ("vbroadcast", v_tmp3, const3_addr)))
-            slots.append(("valu", (op3, v_tmp2, v_val, v_tmp3)))
-            slots.append(("valu", (op2, v_val, v_tmp1, v_tmp2)))
-            
-            # Debug checks for each lane
+            kind, stage_ops = self.hash_stage_kind[hi], self.hash_ops[hi]
+
+            if kind == "mul_add":
+                # Fast path: a = a * mul + add
+                v_mul = self.hash_mul_vec[hi]
+                v_add = self.hash_add_vec[hi]
+                self.add("valu", ("multiply_add", v_val, v_val, v_mul, v_add))
+            else:
+                # Generic 3-op stage:
+                #   tmp1 = op1(a, C1)
+                #   tmp2 = op3(a, C3)
+                #   a    = op2(tmp1, tmp2)
+                g_op1, g_op2, g_op3 = stage_ops
+                v_c1 = self.hash_op1_const[hi]
+                v_shift = self.hash_shift_const[hi]
+
+                self.add("valu", (g_op1, v_tmp1, v_val, v_c1))
+                self.add("valu", (g_op3, v_tmp2, v_val, v_shift))
+                self.add("valu", (g_op2, v_val, v_tmp1, v_tmp2))
+
+            # Debug checks for each lane, in their own instructions so they
+            # see the updated v_val.
             for lane in range(VLEN):
-                slots.append(("debug", ("compare", v_val + lane, (round, vec_i + lane, "hash_stage", hi))))
-        
-        return slots
+                self.add(
+                    "debug",
+                    ("compare", v_val + lane, (round, vec_i + lane, "hash_stage", hi)),
+                )
+
+        # This method emits instructions directly and returns nothing.
+        return None
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -234,7 +263,47 @@ class KernelBuilder:
         # Broadcast n_nodes for bounds checking
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
         self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
-        
+
+        # ===== HASH CONSTANT VECTORS (PRECOMPUTED ONCE) =====
+        self.hash_stage_kind = []
+        self.hash_mul_vec = {}
+        self.hash_add_vec = {}
+        self.hash_op1_const = {}
+        self.hash_shift_const = {}
+        self.hash_ops = {}
+
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                # Stages of the form (a + C1) + (a << k) -> multiply_add
+                mul_const = (1 + (1 << val3)) % (2**32)
+                mul_addr = self.scratch_const(mul_const)
+                add_addr = self.scratch_const(val1)
+
+                v_mul = self.alloc_scratch(f"v_hash_mul_{hi}", VLEN)
+                v_add = self.alloc_scratch(f"v_hash_add_{hi}", VLEN)
+                self.add("valu", ("vbroadcast", v_mul, mul_addr))
+                self.add("valu", ("vbroadcast", v_add, add_addr))
+
+                self.hash_stage_kind.append("mul_add")
+                self.hash_mul_vec[hi] = v_mul
+                self.hash_add_vec[hi] = v_add
+                # For consistency, still store ops (unused in mul_add case)
+                self.hash_ops[hi] = (op1, op2, op3)
+            else:
+                # Generic 3-op stage, keep op1/op2/op3 and pre-broadcast constants
+                c1_addr = self.scratch_const(val1)
+                shift_addr = self.scratch_const(val3)
+
+                v_c1 = self.alloc_scratch(f"v_hash_c1_{hi}", VLEN)
+                v_shift = self.alloc_scratch(f"v_hash_shift_{hi}", VLEN)
+                self.add("valu", ("vbroadcast", v_c1, c1_addr))
+                self.add("valu", ("vbroadcast", v_shift, shift_addr))
+
+                self.hash_stage_kind.append("generic")
+                self.hash_op1_const[hi] = v_c1
+                self.hash_shift_const[hi] = v_shift
+                self.hash_ops[hi] = (op1, op2, op3)
+
         self.add("flow", ("pause",))
         
         # ===== MAIN VECTORIZED LOOP =====
@@ -288,12 +357,11 @@ class KernelBuilder:
                 self.add("valu", ("^", v_val, v_val, v_node_val))
                 
                 # ===== PHASE 4: HASH FUNCTION (6 STAGES, VECTORIZED) =====
-                # Each stage processes all 8 lanes in parallel
-                hash_slots = self.build_hash_vectorized(v_val, v_tmp1, v_tmp2, v_tmp3, round_idx, vec_i)
-                
-                # Pack hash operations efficiently
-                hash_instrs = self.build(hash_slots, vliw=True)
-                self.instrs.extend(hash_instrs)
+                # Each stage processes all 8 lanes in parallel.
+                # The helper emits instructions directly into self.instrs.
+                self.build_hash_vectorized(
+                    v_val, v_tmp1, v_tmp2, v_tmp3, round_idx, vec_i
+                )
                 
                 # Debug: verify hashed values
                 for lane in range(VLEN):
@@ -309,15 +377,8 @@ class KernelBuilder:
                 # Select offset: 1 if even, 2 if odd
                 self.add("flow", ("vselect", v_tmp2, v_is_even, v_one, v_two))
                 
-                # Calculate next_idx = 2*idx + offset
-                # Pack these operations in a bundle
-                idx_calc_bundle = {
-                    "valu": [
-                        ("*", v_next_idx, v_idx, v_two),
-                    ]
-                }
-                self.add_bundle(idx_calc_bundle)
-                self.add("valu", ("+", v_next_idx, v_next_idx, v_tmp2))
+                # Calculate next_idx = 2*idx + offset using vector multiply_add
+                self.add("valu", ("multiply_add", v_next_idx, v_idx, v_two, v_tmp2))
                 
                 # Debug: verify next index
                 for lane in range(VLEN):

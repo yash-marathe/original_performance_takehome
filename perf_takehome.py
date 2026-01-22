@@ -288,19 +288,21 @@ class KernelBuilder:
         self.instrs.append({"flow": [("pause",)]})
     
     def _build_vectorized_kernel(self, rounds, batch_size, hash_consts, zero_const, one_const, two_const):
-        """Vectorized kernel using SIMD instructions with optimized memory access"""
+        """Vectorized kernel with minimal memory operations"""
         body = []
         
-        # Vector scratch registers
-        v_idx = self.alloc_scratch("v_idx", VLEN)
-        v_val = self.alloc_scratch("v_val", VLEN)
+        # Allocate vector registers for each batch - keep data in registers across all rounds!
+        num_batches = batch_size // VLEN
+        batch_v_idx = [self.alloc_scratch(f"batch_idx_{i}", VLEN) for i in range(num_batches)]
+        batch_v_val = [self.alloc_scratch(f"batch_val_{i}", VLEN) for i in range(num_batches)]
+        
+        # Working registers
         v_node_val = self.alloc_scratch("v_node_val", VLEN)
         v_addr = self.alloc_scratch("v_addr", VLEN)
         v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
         v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
-        v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
         
-        # Pre-broadcast constants into vectors to avoid repeated broadcasts
+        # Pre-broadcast constants
         v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
@@ -314,7 +316,6 @@ class KernelBuilder:
             body.append(("valu", ("vbroadcast", vc3, c3)))
             v_hash_consts.append((vc1, vc3))
         
-        # Broadcast common constants once
         body.append(("valu", ("vbroadcast", v_zero, zero_const)))
         body.append(("valu", ("vbroadcast", v_one, one_const)))
         body.append(("valu", ("vbroadcast", v_two, two_const)))
@@ -322,59 +323,62 @@ class KernelBuilder:
         # Scalar temporaries
         s_base_addr = self.alloc_scratch("s_base_addr")
         
-        # Precompute batch start offsets
-        batch_offsets = [self.scratch_const(i) for i in range(0, batch_size, VLEN)]
+        # Load all data once at the start into vector registers
+        for batch_idx in range(num_batches):
+            batch_offset = self.scratch_const(batch_idx * VLEN)
+            
+            # Load indices for this batch
+            body.append(("alu", ("+", s_base_addr, self.scratch["inp_indices_p"], batch_offset)))
+            body.append(("load", ("vload", batch_v_idx[batch_idx], s_base_addr)))
+            
+            # Load values for this batch
+            body.append(("alu", ("+", s_base_addr, self.scratch["inp_values_p"], batch_offset)))
+            body.append(("load", ("vload", batch_v_val[batch_idx], s_base_addr)))
         
+        # Main computation - all data stays in vector registers!
         for round in range(rounds):
-            for batch_idx, batch_start in enumerate(range(0, batch_size, VLEN)):
-                batch_offset = batch_offsets[batch_idx]
+            for batch_idx in range(num_batches):
+                v_idx = batch_v_idx[batch_idx]
+                v_val = batch_v_val[batch_idx]
                 
-                # Calculate base address for indices
-                body.append(("alu", ("+", s_base_addr, self.scratch["inp_indices_p"], batch_offset)))
-                
-                # Use vload to load all 8 indices at once
-                body.append(("load", ("vload", v_idx, s_base_addr)))
-                
-                # Calculate base address for values
-                body.append(("alu", ("+", s_base_addr, self.scratch["inp_values_p"], batch_offset)))
-                
-                # Use vload to load all 8 values at once
-                body.append(("load", ("vload", v_val, s_base_addr)))
-                
-                # Load node values (can't vectorize due to indirect addressing)
+                # Load node values (only memory access in inner loop)
                 for vi in range(VLEN):
                     body.append(("alu", ("+", v_addr + vi, self.scratch["forest_values_p"], v_idx + vi)))
                     body.append(("load", ("load", v_node_val + vi, v_addr + vi)))
                 
-                # XOR with node values (fully vectorized)
+                # XOR
                 body.append(("valu", ("^", v_val, v_val, v_node_val)))
                 
-                # Hash computation (vectorized with pre-broadcasted constants)
+                # Hash
                 for hi, (vc1, vc3) in enumerate(v_hash_consts):
                     op1, val1, op2, op3, val3 = HASH_STAGES[hi]
                     body.append(("valu", (op1, v_tmp1, v_val, vc1)))
                     body.append(("valu", (op3, v_tmp2, v_val, vc3)))
                     body.append(("valu", (op2, v_val, v_tmp1, v_tmp2)))
                 
-                # Compute next index (use pre-broadcasted constants)
-                body.append(("valu", ("%", v_tmp2, v_val, v_two)))
+                # Next index
+                body.append(("valu", ("&", v_tmp2, v_val, v_one)))
                 body.append(("valu", ("==", v_tmp2, v_tmp2, v_zero)))
                 body.append(("flow", ("vselect", v_tmp2, v_tmp2, v_one, v_two)))
-                
                 body.append(("valu", ("*", v_idx, v_idx, v_two)))
                 body.append(("valu", ("+", v_idx, v_idx, v_tmp2)))
                 
-                # Wrap indices (scalar ops since we need conditional)
+                # Wrap
                 for vi in range(VLEN):
                     body.append(("alu", ("<", v_tmp1 + vi, v_idx + vi, self.scratch["n_nodes"])))
                     body.append(("flow", ("select", v_idx + vi, v_tmp1 + vi, v_idx + vi, zero_const)))
-                
-                # Store results using vstore for better performance
-                body.append(("alu", ("+", s_base_addr, self.scratch["inp_indices_p"], batch_offset)))
-                body.append(("store", ("vstore", s_base_addr, v_idx)))
-                
-                body.append(("alu", ("+", s_base_addr, self.scratch["inp_values_p"], batch_offset)))
-                body.append(("store", ("vstore", s_base_addr, v_val)))
+        
+        # Write all results back to memory at the end
+        for batch_idx in range(num_batches):
+            batch_offset = self.scratch_const(batch_idx * VLEN)
+            
+            # Store indices
+            body.append(("alu", ("+", s_base_addr, self.scratch["inp_indices_p"], batch_offset)))
+            body.append(("store", ("vstore", s_base_addr, batch_v_idx[batch_idx])))
+            
+            # Store values
+            body.append(("alu", ("+", s_base_addr, self.scratch["inp_values_p"], batch_offset)))
+            body.append(("store", ("vstore", s_base_addr, batch_v_val[batch_idx])))
         
         body_instrs = self.build(body, vliw=True)
         self.instrs.extend(body_instrs)

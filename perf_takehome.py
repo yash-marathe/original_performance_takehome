@@ -288,20 +288,18 @@ class KernelBuilder:
         self.instrs.append({"flow": [("pause",)]})
     
     def _build_vectorized_kernel(self, rounds, batch_size, hash_consts, zero_const, one_const, two_const):
-        """Vectorized kernel with minimal memory operations"""
+        """Optimized vectorized kernel with aggressive pipelining and ILP"""
         body = []
         
-        # Allocate vector registers for each batch - keep data in registers across all rounds!
+        # Allocate vector registers for each batch
         num_batches = batch_size // VLEN
         batch_v_idx = [self.alloc_scratch(f"batch_idx_{i}", VLEN) for i in range(num_batches)]
         batch_v_val = [self.alloc_scratch(f"batch_val_{i}", VLEN) for i in range(num_batches)]
         
-        # Allocate multiple v_node_val arrays for interleaving
-        INTERLEAVE_FACTOR = min(4, num_batches)
-        v_node_vals = [self.alloc_scratch(f"v_node_val_{i}", VLEN) for i in range(INTERLEAVE_FACTOR)]
-        v_addrs = [self.alloc_scratch(f"v_addr_{i}", VLEN) for i in range(INTERLEAVE_FACTOR)]
-        
-        # Working registers
+        # Working registers - allocate enough for deep pipelining
+        PIPELINE_DEPTH = min(8, num_batches)
+        v_node_vals = [self.alloc_scratch(f"v_node_val_{i}", VLEN) for i in range(PIPELINE_DEPTH)]
+        v_addrs = [self.alloc_scratch(f"v_addr_{i}", VLEN) for i in range(PIPELINE_DEPTH)]
         v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
         v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
         
@@ -325,76 +323,93 @@ class KernelBuilder:
         
         # Scalar temporaries
         s_base_addr = self.alloc_scratch("s_base_addr")
+        s_tmp = self.alloc_scratch("s_tmp")
         
-        # Load all data once at the start into vector registers
+        # Load all data once
         for batch_idx in range(num_batches):
             batch_offset = self.scratch_const(batch_idx * VLEN)
-            
-            # Load indices for this batch
             body.append(("alu", ("+", s_base_addr, self.scratch["inp_indices_p"], batch_offset)))
             body.append(("load", ("vload", batch_v_idx[batch_idx], s_base_addr)))
-            
-            # Load values for this batch
             body.append(("alu", ("+", s_base_addr, self.scratch["inp_values_p"], batch_offset)))
             body.append(("load", ("vload", batch_v_val[batch_idx], s_base_addr)))
         
-        # Main computation - Process multiple batches in an interleaved fashion to maximize ILP
+        # Main computation with software pipelining
+        # Process all rounds with deep pipeline to hide load latency
         for round in range(rounds):
-            for batch_group in range(0, num_batches, INTERLEAVE_FACTOR):
-                group_size = min(INTERLEAVE_FACTOR, num_batches - batch_group)
-                
-                # Interleave address computation and loads for all batches in group
+            # Pipeline: Process multiple batches simultaneously
+            # Stage 1: Issue address computations for first PIPELINE_DEPTH batches
+            for pipe_idx in range(min(PIPELINE_DEPTH, num_batches)):
+                v_idx = batch_v_idx[pipe_idx]
+                v_addr = v_addrs[pipe_idx]
+                # Compute all addresses for this batch vectorially
                 for vi in range(VLEN):
-                    for b_offset in range(group_size):
-                        batch_idx = batch_group + b_offset
-                        v_idx = batch_v_idx[batch_idx]
-                        v_addr = v_addrs[b_offset]
-                        body.append(("alu", ("+", v_addr + vi, self.scratch["forest_values_p"], v_idx + vi)))
-                
+                    body.append(("alu", ("+", v_addr + vi, self.scratch["forest_values_p"], v_idx + vi)))
+            
+            # Stage 2: Issue all loads for first PIPELINE_DEPTH batches
+            for pipe_idx in range(min(PIPELINE_DEPTH, num_batches)):
+                v_addr = v_addrs[pipe_idx]
+                v_node_val = v_node_vals[pipe_idx]
                 for vi in range(VLEN):
-                    for b_offset in range(group_size):
-                        v_addr = v_addrs[b_offset]
-                        v_node_val = v_node_vals[b_offset]
-                        body.append(("load", ("load", v_node_val + vi, v_addr + vi)))
+                    body.append(("load", ("load", v_node_val + vi, v_addr + vi)))
+            
+            # Stage 3: Process each batch in rolling window
+            for batch_idx in range(num_batches):
+                pipe_idx = batch_idx % PIPELINE_DEPTH
+                v_idx = batch_v_idx[batch_idx]
+                v_val = batch_v_val[batch_idx]
+                v_node_val = v_node_vals[pipe_idx]
+                v_addr = v_addrs[pipe_idx]
                 
-                # Process each batch in the group
-                for b_offset in range(group_size):
-                    batch_idx = batch_group + b_offset
-                    v_idx = batch_v_idx[batch_idx]
-                    v_val = batch_v_val[batch_idx]
-                    v_node_val = v_node_vals[b_offset]
-                    
-                    # XOR
-                    body.append(("valu", ("^", v_val, v_val, v_node_val)))
-                    
-                    # Hash
-                    for hi, (vc1, vc3) in enumerate(v_hash_consts):
-                        op1, val1, op2, op3, val3 = HASH_STAGES[hi]
-                        body.append(("valu", (op1, v_tmp1, v_val, vc1)))
-                        body.append(("valu", (op3, v_tmp2, v_val, vc3)))
-                        body.append(("valu", (op2, v_val, v_tmp1, v_tmp2)))
-                    
-                    # Next index
-                    body.append(("valu", ("&", v_tmp2, v_val, v_one)))
-                    body.append(("valu", ("==", v_tmp2, v_tmp2, v_zero)))
-                    body.append(("flow", ("vselect", v_tmp2, v_tmp2, v_one, v_two)))
-                    body.append(("valu", ("<<", v_idx, v_idx, v_one)))
-                    body.append(("valu", ("+", v_idx, v_idx, v_tmp2)))
-                    
-                    # Wrap
+                # If there's a next batch, prefetch its addresses while we compute
+                next_batch = batch_idx + PIPELINE_DEPTH
+                if next_batch < num_batches:
+                    v_next_idx = batch_v_idx[next_batch]
+                    v_next_addr = v_addrs[pipe_idx]
+                    # Compute next addresses in parallel with current computation
+                    for vi in range(min(2, VLEN)):  # Just start the first 2 to keep pipeline going
+                        body.append(("alu", ("+", v_next_addr + vi, self.scratch["forest_values_p"], v_next_idx + vi)))
+                
+                # XOR
+                body.append(("valu", ("^", v_val, v_val, v_node_val)))
+                
+                # Continue prefetching if needed
+                if next_batch < num_batches:
+                    for vi in range(2, min(4, VLEN)):
+                        body.append(("alu", ("+", v_next_addr + vi, self.scratch["forest_values_p"], v_next_idx + vi)))
+                
+                # Hash computation - try to use multiply_add where possible
+                for hi, (vc1, vc3) in enumerate(v_hash_consts):
+                    op1, val1, op2, op3, val3 = HASH_STAGES[hi]
+                    body.append(("valu", (op1, v_tmp1, v_val, vc1)))
+                    body.append(("valu", (op3, v_tmp2, v_val, vc3)))
+                    body.append(("valu", (op2, v_val, v_tmp1, v_tmp2)))
+                
+                # Finish prefetching addresses
+                if next_batch < num_batches:
+                    for vi in range(4, VLEN):
+                        body.append(("alu", ("+", v_next_addr + vi, self.scratch["forest_values_p"], v_next_idx + vi)))
+                    # Issue loads for next batch
+                    v_next_node_val = v_node_vals[pipe_idx]
                     for vi in range(VLEN):
-                        body.append(("alu", ("<", v_tmp1 + vi, v_idx + vi, self.scratch["n_nodes"])))
-                        body.append(("flow", ("select", v_idx + vi, v_tmp1 + vi, v_idx + vi, zero_const)))
+                        body.append(("load", ("load", v_next_node_val + vi, v_next_addr + vi)))
+                
+                # Next index computation
+                body.append(("valu", ("&", v_tmp2, v_val, v_one)))
+                body.append(("valu", ("==", v_tmp2, v_tmp2, v_zero)))
+                body.append(("flow", ("vselect", v_tmp2, v_tmp2, v_one, v_two)))
+                body.append(("valu", ("<<", v_idx, v_idx, v_one)))
+                body.append(("valu", ("+", v_idx, v_idx, v_tmp2)))
+                
+                # Wrap indices
+                for vi in range(VLEN):
+                    body.append(("alu", ("<", v_tmp1 + vi, v_idx + vi, self.scratch["n_nodes"])))
+                    body.append(("flow", ("select", v_idx + vi, v_tmp1 + vi, v_idx + vi, zero_const)))
         
-        # Write all results back to memory at the end
+        # Store results
         for batch_idx in range(num_batches):
             batch_offset = self.scratch_const(batch_idx * VLEN)
-            
-            # Store indices
             body.append(("alu", ("+", s_base_addr, self.scratch["inp_indices_p"], batch_offset)))
             body.append(("store", ("vstore", s_base_addr, batch_v_idx[batch_idx])))
-            
-            # Store values
             body.append(("alu", ("+", s_base_addr, self.scratch["inp_values_p"], batch_offset)))
             body.append(("store", ("vstore", s_base_addr, batch_v_val[batch_idx])))
         

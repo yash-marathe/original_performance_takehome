@@ -242,7 +242,7 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Optimized kernel using VLIW packing and better instruction scheduling.
+        Optimized kernel using VLIW packing and SIMD vectorization.
         """
         # Allocate scratch space for temporaries
         tmp1 = self.alloc_scratch("tmp1")
@@ -262,7 +262,7 @@ class KernelBuilder:
         for v in init_vars:
             self.alloc_scratch(v, 1)
         
-        # Load header values - can't pack these due to tmp1 reuse
+        # Load header values
         for i, v in enumerate(init_vars):
             self.add("load", ("const", tmp1, i))
             self.add("load", ("load", self.scratch[v], tmp1))
@@ -279,9 +279,100 @@ class KernelBuilder:
 
         self.add("flow", ("pause",))
         
-        self._build_scalar_kernel_optimized(rounds, batch_size, hash_consts, zero_const, one_const, two_const)
+        # Use vectorization when batch_size is divisible by VLEN
+        if batch_size % VLEN == 0:
+            self._build_vectorized_kernel(rounds, batch_size, hash_consts, zero_const, one_const, two_const)
+        else:
+            self._build_scalar_kernel_optimized(rounds, batch_size, hash_consts, zero_const, one_const, two_const)
         
         self.instrs.append({"flow": [("pause",)]})
+    
+    def _build_vectorized_kernel(self, rounds, batch_size, hash_consts, zero_const, one_const, two_const):
+        """Vectorized kernel using SIMD instructions"""
+        body = []
+        
+        # Vector scratch registers
+        v_idx = self.alloc_scratch("v_idx", VLEN)
+        v_val = self.alloc_scratch("v_val", VLEN)
+        v_node_val = self.alloc_scratch("v_node_val", VLEN)
+        v_addr = self.alloc_scratch("v_addr", VLEN)
+        v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
+        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
+        v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
+        
+        # Scalar temporaries
+        s_addr = self.alloc_scratch("s_addr")
+        s_tmp = self.alloc_scratch("s_tmp")
+        
+        # Precompute base offset constants for vectorization
+        for round in range(rounds):
+            for batch_start in range(0, batch_size, VLEN):
+                # Load indices - build addresses then load
+                for vi in range(VLEN):
+                    i_offset = self.scratch_const(batch_start + vi)
+                    body.append(("alu", ("+", v_addr + vi, self.scratch["inp_indices_p"], i_offset)))
+                
+                # Load all indices at once
+                for vi in range(VLEN):
+                    body.append(("load", ("load", v_idx + vi, v_addr + vi)))
+                
+                # Load values - build addresses then load
+                for vi in range(VLEN):
+                    i_offset = self.scratch_const(batch_start + vi)
+                    body.append(("alu", ("+", v_addr + vi, self.scratch["inp_values_p"], i_offset)))
+                
+                # Load all values at once
+                for vi in range(VLEN):
+                    body.append(("load", ("load", v_val + vi, v_addr + vi)))
+                
+                # Load node values (address depends on index, so can't fully vectorize)
+                for vi in range(VLEN):
+                    body.append(("alu", ("+", v_addr + vi, self.scratch["forest_values_p"], v_idx + vi)))
+                    body.append(("load", ("load", v_node_val + vi, v_addr + vi)))
+                
+                # XOR with node values (fully vectorized)
+                body.append(("valu", ("^", v_val, v_val, v_node_val)))
+                
+                # Hash computation (vectorized)
+                for hi, ((c1, c3), (op1, val1, op2, op3, val3)) in enumerate(zip(hash_consts, HASH_STAGES)):
+                    body.append(("valu", ("vbroadcast", v_tmp1, c1)))
+                    body.append(("valu", (op1, v_tmp1, v_val, v_tmp1)))
+                    body.append(("valu", ("vbroadcast", v_tmp2, c3)))
+                    body.append(("valu", (op3, v_tmp2, v_val, v_tmp2)))
+                    body.append(("valu", (op2, v_val, v_tmp1, v_tmp2)))
+                
+                # Compute next index (vectorized where possible)
+                body.append(("valu", ("vbroadcast", v_tmp1, two_const)))
+                body.append(("valu", ("%", v_tmp2, v_val, v_tmp1)))
+                body.append(("valu", ("vbroadcast", v_tmp3, zero_const)))
+                body.append(("valu", ("==", v_tmp2, v_tmp2, v_tmp3)))
+                
+                body.append(("valu", ("vbroadcast", v_tmp1, one_const)))
+                body.append(("valu", ("vbroadcast", v_tmp3, two_const)))
+                body.append(("flow", ("vselect", v_tmp2, v_tmp2, v_tmp1, v_tmp3)))
+                
+                body.append(("valu", ("vbroadcast", v_tmp1, two_const)))
+                body.append(("valu", ("*", v_idx, v_idx, v_tmp1)))
+                body.append(("valu", ("+", v_idx, v_idx, v_tmp2)))
+                
+                # Wrap indices (scalar ops since we need conditional)
+                for vi in range(VLEN):
+                    body.append(("alu", ("<", v_tmp1 + vi, v_idx + vi, self.scratch["n_nodes"])))
+                    body.append(("flow", ("select", v_idx + vi, v_tmp1 + vi, v_idx + vi, zero_const)))
+                
+                # Store results
+                for vi in range(VLEN):
+                    i_offset = self.scratch_const(batch_start + vi)
+                    body.append(("alu", ("+", v_addr + vi, self.scratch["inp_indices_p"], i_offset)))
+                    body.append(("store", ("store", v_addr + vi, v_idx + vi)))
+                
+                for vi in range(VLEN):
+                    i_offset = self.scratch_const(batch_start + vi)
+                    body.append(("alu", ("+", v_addr + vi, self.scratch["inp_values_p"], i_offset)))
+                    body.append(("store", ("store", v_addr + vi, v_val + vi)))
+        
+        body_instrs = self.build(body, vliw=True)
+        self.instrs.extend(body_instrs)
     
     def _build_scalar_kernel_optimized(self, rounds, batch_size, hash_consts, zero_const, one_const, two_const):
         """Optimized scalar kernel with VLIW packing and better scheduling"""

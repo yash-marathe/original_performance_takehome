@@ -49,10 +49,163 @@ class KernelBuilder:
         return DebugInfo(scratch_map=self.scratch_debug)
 
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
+        """
+        Build instructions with optional VLIW packing.
+        When vliw=True, pack multiple operations from different engines into single cycles.
+        """
+        if not vliw:
+            instrs = []
+            for engine, slot in slots:
+                instrs.append({engine: [slot]})
+            return instrs
+        
+        # Advanced VLIW packing with dependency tracking
         instrs = []
+        current_bundle = {}
+        slot_counts = {}
+        writes_in_bundle = set()  # Track what scratch addresses are written in current bundle
+        reads_in_bundle = set()   # Track what scratch addresses are read in current bundle
+        
+        def get_slot_reads(engine, slot):
+            """Extract scratch addresses read by this slot"""
+            reads = set()
+            if engine == "alu":
+                # alu: (op, dest, src1, src2) - reads src1, src2
+                if len(slot) >= 4:
+                    reads.add(slot[2])
+                    reads.add(slot[3])
+            elif engine == "valu":
+                # valu operations read from their sources
+                if slot[0] == "vbroadcast":
+                    reads.add(slot[2])
+                elif len(slot) >= 4:
+                    # Most valu ops: (op, dest, src1, src2)
+                    for i in range(VLEN):
+                        reads.add(slot[2] + i)
+                        reads.add(slot[3] + i)
+            elif engine == "load":
+                if slot[0] == "load":
+                    reads.add(slot[2])  # addr
+                elif slot[0] == "load_offset":
+                    reads.add(slot[2] + slot[3])
+                elif slot[0] == "vload":
+                    reads.add(slot[2])
+                # const doesn't read
+            elif engine == "store":
+                if slot[0] == "store":
+                    reads.add(slot[1])  # addr
+                    reads.add(slot[2])  # src
+                elif slot[0] == "vstore":
+                    reads.add(slot[1])  # addr
+                    for i in range(VLEN):
+                        reads.add(slot[2] + i)  # src vector
+            elif engine == "flow":
+                if slot[0] == "select":
+                    reads.add(slot[2])  # cond
+                    reads.add(slot[3])  # a
+                    reads.add(slot[4])  # b
+                elif slot[0] == "add_imm":
+                    reads.add(slot[2])  # a
+                elif slot[0] == "vselect":
+                    for i in range(VLEN):
+                        reads.add(slot[2] + i)  # cond
+                        reads.add(slot[3] + i)  # a
+                        reads.add(slot[4] + i)  # b
+                elif slot[0] == "cond_jump":
+                    reads.add(slot[1])  # cond
+                elif slot[0] == "cond_jump_rel":
+                    reads.add(slot[1])  # cond
+                elif slot[0] == "jump_indirect":
+                    reads.add(slot[1])  # addr
+                elif slot[0] == "trace_write":
+                    reads.add(slot[1])  # val
+            return reads
+        
+        def get_slot_writes(engine, slot):
+            """Extract scratch addresses written by this slot"""
+            writes = set()
+            if engine == "alu":
+                writes.add(slot[1])  # dest
+            elif engine == "valu":
+                # Most valu ops write to dest
+                for i in range(VLEN):
+                    writes.add(slot[1] + i)
+            elif engine == "load":
+                if slot[0] in ["load", "const"]:
+                    writes.add(slot[1])  # dest
+                elif slot[0] == "load_offset":
+                    writes.add(slot[1] + slot[3])
+                elif slot[0] == "vload":
+                    for i in range(VLEN):
+                        writes.add(slot[1] + i)
+            elif engine == "flow":
+                if slot[0] in ["select", "add_imm", "coreid"]:
+                    writes.add(slot[1])  # dest
+                elif slot[0] == "vselect":
+                    for i in range(VLEN):
+                        writes.add(slot[1] + i)
+            return writes
+        
+        def has_dependency(engine, slot):
+            """Check if this slot has a dependency on current bundle"""
+            reads = get_slot_reads(engine, slot)
+            slot_writes = get_slot_writes(engine, slot)
+            
+            # Check RAW (Read After Write): can't read what current bundle writes
+            if reads & writes_in_bundle:
+                return True
+            
+            # Check WAW (Write After Write): can't write to same location
+            if slot_writes & writes_in_bundle:
+                return True
+            
+            # Check WAR (Write After Read): can't write what current bundle reads
+            # This is less critical in VLIW since effects happen at end of cycle
+            # but let's be conservative
+            if slot_writes & reads_in_bundle:
+                return True
+            
+            return False
+        
+        def flush_bundle():
+            """Flush current bundle to instructions"""
+            nonlocal current_bundle, slot_counts, writes_in_bundle, reads_in_bundle
+            if current_bundle:
+                instrs.append(current_bundle)
+            current_bundle = {}
+            slot_counts = {}
+            writes_in_bundle = set()
+            reads_in_bundle = set()
+        
         for engine, slot in slots:
-            instrs.append({engine: [slot]})
+            # Skip debug in submission mode
+            if engine == "debug":
+                continue
+            
+            # Check slot limits
+            count = slot_counts.get(engine, 0)
+            if count >= SLOT_LIMITS[engine]:
+                flush_bundle()
+                count = 0
+            
+            # Check dependencies
+            if has_dependency(engine, slot):
+                flush_bundle()
+                count = 0
+            
+            # Add slot to current bundle
+            if engine not in current_bundle:
+                current_bundle[engine] = []
+            current_bundle[engine].append(slot)
+            slot_counts[engine] = count + 1
+            
+            # Track reads and writes
+            writes_in_bundle.update(get_slot_writes(engine, slot))
+            reads_in_bundle.update(get_slot_reads(engine, slot))
+        
+        # Flush remaining bundle
+        flush_bundle()
+        
         return instrs
 
     def add(self, engine, slot):
@@ -89,13 +242,14 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        Optimized kernel using VLIW packing and better instruction scheduling.
         """
+        # Allocate scratch space for temporaries
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
+        
+        # Scratch space addresses for header values
         init_vars = [
             "rounds",
             "n_nodes",
@@ -107,71 +261,92 @@ class KernelBuilder:
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
+        
+        # Load header values - can't pack these due to tmp1 reuse
         for i, v in enumerate(init_vars):
             self.add("load", ("const", tmp1, i))
             self.add("load", ("load", self.scratch[v], tmp1))
 
+        # Precompute constants
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
+        
+        # Hash constants
+        hash_consts = []
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            hash_consts.append((self.scratch_const(val1), self.scratch_const(val3)))
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
         self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
-
-        body = []  # array of slots
-
+        
+        self._build_scalar_kernel_optimized(rounds, batch_size, hash_consts, zero_const, one_const, two_const)
+        
+        self.instrs.append({"flow": [("pause",)]})
+    
+    def _build_scalar_kernel_optimized(self, rounds, batch_size, hash_consts, zero_const, one_const, two_const):
+        """Optimized scalar kernel with VLIW packing and better scheduling"""
+        body = []
+        
         # Scalar scratch registers
         tmp_idx = self.alloc_scratch("tmp_idx")
         tmp_val = self.alloc_scratch("tmp_val")
         tmp_node_val = self.alloc_scratch("tmp_node_val")
         tmp_addr = self.alloc_scratch("tmp_addr")
-
+        tmp_addr2 = self.alloc_scratch("tmp_addr2")
+        tmp1 = self.alloc_scratch("tmp1")
+        tmp2 = self.alloc_scratch("tmp2")
+        tmp3 = self.alloc_scratch("tmp3")
+        
+        # Precompute address offsets
+        i_offsets = [self.scratch_const(i) for i in range(batch_size)]
+        
         for round in range(rounds):
             for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
+                i_const = i_offsets[i]
+                
+                # Compute addresses in parallel
                 body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
+                body.append(("alu", ("+", tmp_addr2, self.scratch["inp_values_p"], i_const)))
+                
+                # Load idx and val
                 body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
+                body.append(("load", ("load", tmp_val, tmp_addr2)))
+                
+                # Compute node address and load
                 body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
                 body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
+                
+                # XOR
                 body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
+                
+                # Hash (pack multiple ALU ops together)
+                for hi, ((c1, c3), (op1, val1, op2, op3, val3)) in enumerate(zip(hash_consts, HASH_STAGES)):
+                    body.append(("alu", (op1, tmp1, tmp_val, c1)))
+                    body.append(("alu", (op3, tmp2, tmp_val, c3)))
+                    body.append(("alu", (op2, tmp_val, tmp1, tmp2)))
+                
+                # Compute next index (pack operations)
                 body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
                 body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
+                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
+                
+                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
                 body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
+                
+                # Wrap index
                 body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
                 body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
+                
+                # Compute store addresses
                 body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
+                body.append(("alu", ("+", tmp_addr2, self.scratch["inp_values_p"], i_const)))
+                
+                # Store
                 body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
-
-        body_instrs = self.build(body)
+                body.append(("store", ("store", tmp_addr2, tmp_val)))
+        
+        body_instrs = self.build(body, vliw=True)
         self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
-        self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
 

@@ -485,7 +485,6 @@ class KernelBuilder:
         v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)         # Temp for hash/arithmetic
         v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)         # Temp for broadcasts/select
         v_next_idx = self.alloc_scratch("v_next_idx", VLEN) # Next iteration indices
-        v_is_even = self.alloc_scratch("v_is_even", VLEN)   # Evenness mask for branching
         v_in_bounds = self.alloc_scratch("v_in_bounds", VLEN) # Bounds check mask
 
         # Second set of vector registers for software pipelining / unrolling
@@ -496,7 +495,6 @@ class KernelBuilder:
         v_tmp2_b = self.alloc_scratch("v_tmp2_b", VLEN)
         v_tmp3_b = self.alloc_scratch("v_tmp3_b", VLEN)
         v_next_idx_b = self.alloc_scratch("v_next_idx_b", VLEN)
-        v_is_even_b = self.alloc_scratch("v_is_even_b", VLEN)
         v_in_bounds_b = self.alloc_scratch("v_in_bounds_b", VLEN)
 
         # Third and fourth sets for more ILP (4-way unrolling)
@@ -507,7 +505,6 @@ class KernelBuilder:
         v_tmp2_c = self.alloc_scratch("v_tmp2_c", VLEN)
         v_tmp3_c = self.alloc_scratch("v_tmp3_c", VLEN)
         v_next_idx_c = self.alloc_scratch("v_next_idx_c", VLEN)
-        v_is_even_c = self.alloc_scratch("v_is_even_c", VLEN)
         v_in_bounds_c = self.alloc_scratch("v_in_bounds_c", VLEN)
 
         v_idx_d = self.alloc_scratch("v_idx_d", VLEN)
@@ -517,7 +514,6 @@ class KernelBuilder:
         v_tmp2_d = self.alloc_scratch("v_tmp2_d", VLEN)
         v_tmp3_d = self.alloc_scratch("v_tmp3_d", VLEN)
         v_next_idx_d = self.alloc_scratch("v_next_idx_d", VLEN)
-        v_is_even_d = self.alloc_scratch("v_is_even_d", VLEN)
         v_in_bounds_d = self.alloc_scratch("v_in_bounds_d", VLEN)
         
         # Scalar temps for tree node loading
@@ -693,9 +689,11 @@ class KernelBuilder:
                     v_val, v_tmp1, v_tmp2, v_tmp3, round_idx, vec_i0
                 )
 
+                # Compute offset = 1 + (val % 2) using only VALU ops:
+                #   v_tmp1 = val % 2
+                #   v_tmp2 = v_tmp1 + 1
                 self.add("valu", ("%", v_tmp1, v_val, v_two))
-                self.add("valu", ("==", v_is_even, v_tmp1, v_zero))
-                self.add("flow", ("vselect", v_tmp2, v_is_even, v_one, v_two))
+                self.add("valu", ("+", v_tmp2, v_tmp1, v_one))
                 self.add("valu", ("multiply_add", v_next_idx, v_idx, v_two, v_tmp2))
                 self.add("valu", ("<", v_in_bounds, v_next_idx, v_n_nodes))
                 self.add("flow", ("vselect", v_idx, v_in_bounds, v_next_idx, v_zero))
@@ -718,8 +716,7 @@ class KernelBuilder:
                 )
 
                 self.add("valu", ("%", v_tmp1_b, v_val_b, v_two))
-                self.add("valu", ("==", v_is_even_b, v_tmp1_b, v_zero))
-                self.add("flow", ("vselect", v_tmp2_b, v_is_even_b, v_one, v_two))
+                self.add("valu", ("+", v_tmp2_b, v_tmp1_b, v_one))
                 self.add("valu", ("multiply_add", v_next_idx_b, v_idx_b, v_two, v_tmp2_b))
                 self.add("valu", ("<", v_in_bounds_b, v_next_idx_b, v_n_nodes))
                 self.add("flow", ("vselect", v_idx_b, v_in_bounds_b, v_next_idx_b, v_zero))
@@ -742,8 +739,7 @@ class KernelBuilder:
                 )
 
                 self.add("valu", ("%", v_tmp1_c, v_val_c, v_two))
-                self.add("valu", ("==", v_is_even_c, v_tmp1_c, v_zero))
-                self.add("flow", ("vselect", v_tmp2_c, v_is_even_c, v_one, v_two))
+                self.add("valu", ("+", v_tmp2_c, v_tmp1_c, v_one))
                 self.add("valu", ("multiply_add", v_next_idx_c, v_idx_c, v_two, v_tmp2_c))
                 self.add("valu", ("<", v_in_bounds_c, v_next_idx_c, v_n_nodes))
                 self.add("flow", ("vselect", v_idx_c, v_in_bounds_c, v_next_idx_c, v_zero))
@@ -766,8 +762,7 @@ class KernelBuilder:
                 )
 
                 self.add("valu", ("%", v_tmp1_d, v_val_d, v_two))
-                self.add("valu", ("==", v_is_even_d, v_tmp1_d, v_zero))
-                self.add("flow", ("vselect", v_tmp2_d, v_is_even_d, v_one, v_two))
+                self.add("valu", ("+", v_tmp2_d, v_tmp1_d, v_one))
                 self.add("valu", ("multiply_add", v_next_idx_d, v_idx_d, v_two, v_tmp2_d))
                 self.add("valu", ("<", v_in_bounds_d, v_next_idx_d, v_n_nodes))
                 self.add("flow", ("vselect", v_idx_d, v_in_bounds_d, v_next_idx_d, v_zero))

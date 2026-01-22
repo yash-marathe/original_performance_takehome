@@ -288,7 +288,7 @@ class KernelBuilder:
         self.instrs.append({"flow": [("pause",)]})
     
     def _build_vectorized_kernel(self, rounds, batch_size, hash_consts, zero_const, one_const, two_const):
-        """Vectorized kernel using SIMD instructions"""
+        """Vectorized kernel using SIMD instructions with optimized memory access"""
         body = []
         
         # Vector scratch registers
@@ -301,31 +301,28 @@ class KernelBuilder:
         v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
         
         # Scalar temporaries
-        s_addr = self.alloc_scratch("s_addr")
-        s_tmp = self.alloc_scratch("s_tmp")
+        s_base_addr = self.alloc_scratch("s_base_addr")
         
-        # Precompute base offset constants for vectorization
+        # Precompute batch start offsets
+        batch_offsets = [self.scratch_const(i) for i in range(0, batch_size, VLEN)]
+        
         for round in range(rounds):
-            for batch_start in range(0, batch_size, VLEN):
-                # Load indices - build addresses then load
-                for vi in range(VLEN):
-                    i_offset = self.scratch_const(batch_start + vi)
-                    body.append(("alu", ("+", v_addr + vi, self.scratch["inp_indices_p"], i_offset)))
+            for batch_idx, batch_start in enumerate(range(0, batch_size, VLEN)):
+                batch_offset = batch_offsets[batch_idx]
                 
-                # Load all indices at once
-                for vi in range(VLEN):
-                    body.append(("load", ("load", v_idx + vi, v_addr + vi)))
+                # Calculate base address for indices
+                body.append(("alu", ("+", s_base_addr, self.scratch["inp_indices_p"], batch_offset)))
                 
-                # Load values - build addresses then load
-                for vi in range(VLEN):
-                    i_offset = self.scratch_const(batch_start + vi)
-                    body.append(("alu", ("+", v_addr + vi, self.scratch["inp_values_p"], i_offset)))
+                # Use vload to load all 8 indices at once
+                body.append(("load", ("vload", v_idx, s_base_addr)))
                 
-                # Load all values at once
-                for vi in range(VLEN):
-                    body.append(("load", ("load", v_val + vi, v_addr + vi)))
+                # Calculate base address for values
+                body.append(("alu", ("+", s_base_addr, self.scratch["inp_values_p"], batch_offset)))
                 
-                # Load node values (address depends on index, so can't fully vectorize)
+                # Use vload to load all 8 values at once
+                body.append(("load", ("vload", v_val, s_base_addr)))
+                
+                # Load node values (can't vectorize due to indirect addressing)
                 for vi in range(VLEN):
                     body.append(("alu", ("+", v_addr + vi, self.scratch["forest_values_p"], v_idx + vi)))
                     body.append(("load", ("load", v_node_val + vi, v_addr + vi)))
@@ -360,16 +357,12 @@ class KernelBuilder:
                     body.append(("alu", ("<", v_tmp1 + vi, v_idx + vi, self.scratch["n_nodes"])))
                     body.append(("flow", ("select", v_idx + vi, v_tmp1 + vi, v_idx + vi, zero_const)))
                 
-                # Store results
-                for vi in range(VLEN):
-                    i_offset = self.scratch_const(batch_start + vi)
-                    body.append(("alu", ("+", v_addr + vi, self.scratch["inp_indices_p"], i_offset)))
-                    body.append(("store", ("store", v_addr + vi, v_idx + vi)))
+                # Store results using vstore for better performance
+                body.append(("alu", ("+", s_base_addr, self.scratch["inp_indices_p"], batch_offset)))
+                body.append(("store", ("vstore", s_base_addr, v_idx)))
                 
-                for vi in range(VLEN):
-                    i_offset = self.scratch_const(batch_start + vi)
-                    body.append(("alu", ("+", v_addr + vi, self.scratch["inp_values_p"], i_offset)))
-                    body.append(("store", ("store", v_addr + vi, v_val + vi)))
+                body.append(("alu", ("+", s_base_addr, self.scratch["inp_values_p"], batch_offset)))
+                body.append(("store", ("vstore", s_base_addr, v_val)))
         
         body_instrs = self.build(body, vliw=True)
         self.instrs.extend(body_instrs)

@@ -634,46 +634,12 @@ class KernelBuilder:
                 vec_i2 = vec_i + 2 * VLEN
                 vec_i3 = vec_i + 3 * VLEN
 
-                # ===== PHASE 1: LOAD BATCH DATA FROM SCRATCH (NO MEMORY) =====
-                # Group A
-                self.add(
-                    "valu",
-                    ("+", v_idx, s_idx_base + vec_i0, v_zero),
-                )
-                self.add(
-                    "valu",
-                    ("+", v_val, s_val_base + vec_i0, v_zero),
-                )
-                # Group B
-                self.add(
-                    "valu",
-                    ("+", v_idx_b, s_idx_base + vec_i1, v_zero),
-                )
-                self.add(
-                    "valu",
-                    ("+", v_val_b, s_val_base + vec_i1, v_zero),
-                )
-                # Group C
-                self.add(
-                    "valu",
-                    ("+", v_idx_c, s_idx_base + vec_i2, v_zero),
-                )
-                self.add(
-                    "valu",
-                    ("+", v_val_c, s_val_base + vec_i2, v_zero),
-                )
-                # Group D
-                self.add(
-                    "valu",
-                    ("+", v_idx_d, s_idx_base + vec_i3, v_zero),
-                )
-                self.add(
-                    "valu",
-                    ("+", v_val_d, s_val_base + vec_i3, v_zero),
-                )
+                # ===== PHASES 1–6 FOR GROUP A (OPERATE IN-PLACE ON SCRATCH) =====
+                # Use s_idx_base/s_val_base segments directly as the working vectors.
+                idx_a = s_idx_base + vec_i0
+                val_a = s_val_base + vec_i0
 
-                # ===== PHASES 2–6 FOR GROUP A =====
-                self.add("valu", ("+", v_tree_addr, v_forest_base, v_idx))
+                self.add("valu", ("+", v_tree_addr, v_forest_base, idx_a))
                 for lane_pair_start in range(0, VLEN, 2):
                     bundle = {
                         "load": [
@@ -683,23 +649,25 @@ class KernelBuilder:
                     }
                     self.add_bundle(bundle)
 
-                self.add("valu", ("^", v_val, v_val, v_node_val))
+                # val_a ^= node_val
+                self.add("valu", ("^", val_a, val_a, v_node_val))
 
                 self.build_hash_vectorized(
-                    v_val, v_tmp1, v_tmp2, v_tmp3, round_idx, vec_i0
+                    val_a, v_tmp1, v_tmp2, v_tmp3, round_idx, vec_i0
                 )
 
-                # Compute offset = 1 + (val % 2) using only VALU ops:
-                #   v_tmp1 = val % 2
-                #   v_tmp2 = v_tmp1 + 1
-                self.add("valu", ("%", v_tmp1, v_val, v_two))
+                # offset = 1 + (val % 2) using only VALU ops, in-place on val_a
+                self.add("valu", ("%", v_tmp1, val_a, v_two))
                 self.add("valu", ("+", v_tmp2, v_tmp1, v_one))
-                self.add("valu", ("multiply_add", v_next_idx, v_idx, v_two, v_tmp2))
+                self.add("valu", ("multiply_add", v_next_idx, idx_a, v_two, v_tmp2))
                 self.add("valu", ("<", v_in_bounds, v_next_idx, v_n_nodes))
-                self.add("flow", ("vselect", v_idx, v_in_bounds, v_next_idx, v_zero))
+                self.add("flow", ("vselect", idx_a, v_in_bounds, v_next_idx, v_zero))
 
-                # ===== PHASES 2–6 FOR GROUP B =====
-                self.add("valu", ("+", v_tree_addr_b, v_forest_base, v_idx_b))
+                # ===== PHASES 1–6 FOR GROUP B =====
+                idx_b = s_idx_base + vec_i1
+                val_b = s_val_base + vec_i1
+
+                self.add("valu", ("+", v_tree_addr_b, v_forest_base, idx_b))
                 for lane_pair_start in range(0, VLEN, 2):
                     bundle = {
                         "load": [
@@ -709,20 +677,23 @@ class KernelBuilder:
                     }
                     self.add_bundle(bundle)
 
-                self.add("valu", ("^", v_val_b, v_val_b, v_node_val_b))
+                self.add("valu", ("^", val_b, val_b, v_node_val_b))
 
                 self.build_hash_vectorized(
-                    v_val_b, v_tmp1_b, v_tmp2_b, v_tmp3_b, round_idx, vec_i1
+                    val_b, v_tmp1_b, v_tmp2_b, v_tmp3_b, round_idx, vec_i1
                 )
 
-                self.add("valu", ("%", v_tmp1_b, v_val_b, v_two))
+                self.add("valu", ("%", v_tmp1_b, val_b, v_two))
                 self.add("valu", ("+", v_tmp2_b, v_tmp1_b, v_one))
-                self.add("valu", ("multiply_add", v_next_idx_b, v_idx_b, v_two, v_tmp2_b))
+                self.add("valu", ("multiply_add", v_next_idx_b, idx_b, v_two, v_tmp2_b))
                 self.add("valu", ("<", v_in_bounds_b, v_next_idx_b, v_n_nodes))
-                self.add("flow", ("vselect", v_idx_b, v_in_bounds_b, v_next_idx_b, v_zero))
+                self.add("flow", ("vselect", idx_b, v_in_bounds_b, v_next_idx_b, v_zero))
 
-                # ===== PHASES 2–6 FOR GROUP C =====
-                self.add("valu", ("+", v_tree_addr_c, v_forest_base, v_idx_c))
+                # ===== PHASES 1–6 FOR GROUP C =====
+                idx_c = s_idx_base + vec_i2
+                val_c = s_val_base + vec_i2
+
+                self.add("valu", ("+", v_tree_addr_c, v_forest_base, idx_c))
                 for lane_pair_start in range(0, VLEN, 2):
                     bundle = {
                         "load": [
@@ -732,20 +703,23 @@ class KernelBuilder:
                     }
                     self.add_bundle(bundle)
 
-                self.add("valu", ("^", v_val_c, v_val_c, v_node_val_c))
+                self.add("valu", ("^", val_c, val_c, v_node_val_c))
 
                 self.build_hash_vectorized(
-                    v_val_c, v_tmp1_c, v_tmp2_c, v_tmp3_c, round_idx, vec_i2
+                    val_c, v_tmp1_c, v_tmp2_c, v_tmp3_c, round_idx, vec_i2
                 )
 
-                self.add("valu", ("%", v_tmp1_c, v_val_c, v_two))
+                self.add("valu", ("%", v_tmp1_c, val_c, v_two))
                 self.add("valu", ("+", v_tmp2_c, v_tmp1_c, v_one))
-                self.add("valu", ("multiply_add", v_next_idx_c, v_idx_c, v_two, v_tmp2_c))
+                self.add("valu", ("multiply_add", v_next_idx_c, idx_c, v_two, v_tmp2_c))
                 self.add("valu", ("<", v_in_bounds_c, v_next_idx_c, v_n_nodes))
-                self.add("flow", ("vselect", v_idx_c, v_in_bounds_c, v_next_idx_c, v_zero))
+                self.add("flow", ("vselect", idx_c, v_in_bounds_c, v_next_idx_c, v_zero))
 
-                # ===== PHASES 2–6 FOR GROUP D =====
-                self.add("valu", ("+", v_tree_addr_d, v_forest_base, v_idx_d))
+                # ===== PHASES 1–6 FOR GROUP D =====
+                idx_d = s_idx_base + vec_i3
+                val_d = s_val_base + vec_i3
+
+                self.add("valu", ("+", v_tree_addr_d, v_forest_base, idx_d))
                 for lane_pair_start in range(0, VLEN, 2):
                     bundle = {
                         "load": [
@@ -755,51 +729,17 @@ class KernelBuilder:
                     }
                     self.add_bundle(bundle)
 
-                self.add("valu", ("^", v_val_d, v_val_d, v_node_val_d))
+                self.add("valu", ("^", val_d, val_d, v_node_val_d))
 
                 self.build_hash_vectorized(
-                    v_val_d, v_tmp1_d, v_tmp2_d, v_tmp3_d, round_idx, vec_i3
+                    val_d, v_tmp1_d, v_tmp2_d, v_tmp3_d, round_idx, vec_i3
                 )
 
-                self.add("valu", ("%", v_tmp1_d, v_val_d, v_two))
+                self.add("valu", ("%", v_tmp1_d, val_d, v_two))
                 self.add("valu", ("+", v_tmp2_d, v_tmp1_d, v_one))
-                self.add("valu", ("multiply_add", v_next_idx_d, v_idx_d, v_two, v_tmp2_d))
+                self.add("valu", ("multiply_add", v_next_idx_d, idx_d, v_two, v_tmp2_d))
                 self.add("valu", ("<", v_in_bounds_d, v_next_idx_d, v_n_nodes))
-                self.add("flow", ("vselect", v_idx_d, v_in_bounds_d, v_next_idx_d, v_zero))
-
-                # ===== PHASE 7: STORE RESULTS BACK INTO SCRATCH (VECTORIZED) =====
-                self.add(
-                    "valu",
-                    ("+", s_idx_base + vec_i0, v_idx, v_zero),
-                )
-                self.add(
-                    "valu",
-                    ("+", s_val_base + vec_i0, v_val, v_zero),
-                )
-                self.add(
-                    "valu",
-                    ("+", s_idx_base + vec_i1, v_idx_b, v_zero),
-                )
-                self.add(
-                    "valu",
-                    ("+", s_val_base + vec_i1, v_val_b, v_zero),
-                )
-                self.add(
-                    "valu",
-                    ("+", s_idx_base + vec_i2, v_idx_c, v_zero),
-                )
-                self.add(
-                    "valu",
-                    ("+", s_val_base + vec_i2, v_val_c, v_zero),
-                )
-                self.add(
-                    "valu",
-                    ("+", s_idx_base + vec_i3, v_idx_d, v_zero),
-                )
-                self.add(
-                    "valu",
-                    ("+", s_val_base + vec_i3, v_val_d, v_zero),
-                )
+                self.add("flow", ("vselect", idx_d, v_in_bounds_d, v_next_idx_d, v_zero))
 
         # ===== WRITE FINAL RESULTS BACK TO MEMORY =====
         # After all rounds, copy the scratch-backed indices and values back to

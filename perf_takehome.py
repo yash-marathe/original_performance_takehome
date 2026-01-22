@@ -300,6 +300,25 @@ class KernelBuilder:
         v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
         v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
         
+        # Pre-broadcast constants into vectors to avoid repeated broadcasts
+        v_zero = self.alloc_scratch("v_zero", VLEN)
+        v_one = self.alloc_scratch("v_one", VLEN)
+        v_two = self.alloc_scratch("v_two", VLEN)
+        
+        # Pre-broadcast hash constants
+        v_hash_consts = []
+        for c1, c3 in hash_consts:
+            vc1 = self.alloc_scratch(f"v_hash_c1_{c1}", VLEN)
+            vc3 = self.alloc_scratch(f"v_hash_c3_{c3}", VLEN)
+            body.append(("valu", ("vbroadcast", vc1, c1)))
+            body.append(("valu", ("vbroadcast", vc3, c3)))
+            v_hash_consts.append((vc1, vc3))
+        
+        # Broadcast common constants once
+        body.append(("valu", ("vbroadcast", v_zero, zero_const)))
+        body.append(("valu", ("vbroadcast", v_one, one_const)))
+        body.append(("valu", ("vbroadcast", v_two, two_const)))
+        
         # Scalar temporaries
         s_base_addr = self.alloc_scratch("s_base_addr")
         
@@ -330,26 +349,19 @@ class KernelBuilder:
                 # XOR with node values (fully vectorized)
                 body.append(("valu", ("^", v_val, v_val, v_node_val)))
                 
-                # Hash computation (vectorized)
-                for hi, ((c1, c3), (op1, val1, op2, op3, val3)) in enumerate(zip(hash_consts, HASH_STAGES)):
-                    body.append(("valu", ("vbroadcast", v_tmp1, c1)))
-                    body.append(("valu", (op1, v_tmp1, v_val, v_tmp1)))
-                    body.append(("valu", ("vbroadcast", v_tmp2, c3)))
-                    body.append(("valu", (op3, v_tmp2, v_val, v_tmp2)))
+                # Hash computation (vectorized with pre-broadcasted constants)
+                for hi, (vc1, vc3) in enumerate(v_hash_consts):
+                    op1, val1, op2, op3, val3 = HASH_STAGES[hi]
+                    body.append(("valu", (op1, v_tmp1, v_val, vc1)))
+                    body.append(("valu", (op3, v_tmp2, v_val, vc3)))
                     body.append(("valu", (op2, v_val, v_tmp1, v_tmp2)))
                 
-                # Compute next index (vectorized where possible)
-                body.append(("valu", ("vbroadcast", v_tmp1, two_const)))
-                body.append(("valu", ("%", v_tmp2, v_val, v_tmp1)))
-                body.append(("valu", ("vbroadcast", v_tmp3, zero_const)))
-                body.append(("valu", ("==", v_tmp2, v_tmp2, v_tmp3)))
+                # Compute next index (use pre-broadcasted constants)
+                body.append(("valu", ("%", v_tmp2, v_val, v_two)))
+                body.append(("valu", ("==", v_tmp2, v_tmp2, v_zero)))
+                body.append(("flow", ("vselect", v_tmp2, v_tmp2, v_one, v_two)))
                 
-                body.append(("valu", ("vbroadcast", v_tmp1, one_const)))
-                body.append(("valu", ("vbroadcast", v_tmp3, two_const)))
-                body.append(("flow", ("vselect", v_tmp2, v_tmp2, v_tmp1, v_tmp3)))
-                
-                body.append(("valu", ("vbroadcast", v_tmp1, two_const)))
-                body.append(("valu", ("*", v_idx, v_idx, v_tmp1)))
+                body.append(("valu", ("*", v_idx, v_idx, v_two)))
                 body.append(("valu", ("+", v_idx, v_idx, v_tmp2)))
                 
                 # Wrap indices (scalar ops since we need conditional)

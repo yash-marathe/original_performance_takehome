@@ -282,6 +282,173 @@ class NodeCentricKernelBuilder(KernelBuilder):
             self.add("store", ("store", tmp1, s_val_cur + i))
 
 
+class PipelinedRoundsKernelBuilder(KernelBuilder):
+    """
+    Experimental *lane-wise software pipelined* kernel (A2 idea).
+
+    For each round, we treat the per-lane update as a two-stage pipeline:
+      - Stage A: load node_val for a lane's current index.
+      - Stage B: hash and update using the node_val loaded in the previous
+        iteration.
+
+    Concretely, within each round we:
+      - Pre-load node_val for lane 0.
+      - For i = 1..batch_size-1:
+          * Stage A: load node_val for lane i into `node_val_curr`.
+          * Stage B: process lane i-1 using `node_val_prev`.
+          * node_val_prev = node_val_curr
+      - Finally, flush lane batch_size-1 using the last node_val_prev.
+
+    This overlaps "current" loads with "previous" hashes conceptually.
+    It is scalar and intended only for small problem sizes.
+    """
+
+    def build_hash_scalar(self, a_addr: int, tmp1: int, tmp2: int):
+        """
+        Scalar myhash(a) implemented with ALU ops over scratch.
+        """
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            c1 = self.scratch_const(val1)
+            c3 = self.scratch_const(val3)
+            self.add("alu", (op1, tmp1, a_addr, c1))
+            self.add("alu", (op3, tmp2, a_addr, c3))
+            self.add("alu", (op2, a_addr, tmp1, tmp2))
+
+    def build_kernel(
+        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+    ):
+        # This experimental kernel is only tractable for small instances.
+        assert (
+            n_nodes <= 64 and batch_size <= 32 and rounds <= 8
+        ), "PipelinedRoundsKernelBuilder is only intended for small sizes"
+
+        # Basic temporaries
+        tmp1 = self.alloc_scratch("tmp1")
+        tmp2 = self.alloc_scratch("tmp2")
+
+        # Load configuration from memory into scratch
+        init_vars = [
+            "rounds",
+            "n_nodes",
+            "batch_size",
+            "forest_height",
+            "forest_values_p",
+            "inp_indices_p",
+            "inp_values_p",
+        ]
+        for v in init_vars:
+            self.alloc_scratch(v, 1)
+        for i, v in enumerate(init_vars):
+            self.add("load", ("const", tmp1, i))
+            self.add("load", ("load", self.scratch[v], tmp1))
+
+        # Constants
+        zero = self.scratch_const(0)
+        one = self.scratch_const(1)
+        two = self.scratch_const(2)
+
+        # State arrays for indices and values
+        s_idx_base = self.alloc_scratch("s_idx", batch_size)
+        s_val_base = self.alloc_scratch("s_val", batch_size)
+
+        # Preload indices and values from memory into scratch
+        for i in range(batch_size):
+            off = self.scratch_const(i)
+
+            # idx[i]
+            self.add("alu", ("+", tmp1, self.scratch["inp_indices_p"], off))
+            self.add("load", ("load", s_idx_base + i, tmp1))
+
+            # val[i]
+            self.add("alu", ("+", tmp1, self.scratch["inp_values_p"], off))
+            self.add("load", ("load", s_val_base + i, tmp1))
+
+        # Hash and update temporaries
+        a_addr = self.alloc_scratch("hash_a")
+        t1 = self.alloc_scratch("hash_t1")
+        t2 = self.alloc_scratch("hash_t2")
+        parity = self.alloc_scratch("parity")
+        offset = self.alloc_scratch("offset")
+        next_idx = self.alloc_scratch("next_idx")
+        in_bounds = self.alloc_scratch("in_bounds")
+        node_val_prev = self.alloc_scratch("node_val_prev")
+        node_val_curr = self.alloc_scratch("node_val_curr")
+
+        # Helper to emit "stage B" for a single lane j using node_val_prev
+        def emit_stage_b(j: int):
+            idx_addr = s_idx_base + j
+            val_addr = s_val_base + j
+
+            # a = val[j] ^ node_val_prev
+            self.add("alu", ("^", a_addr, val_addr, node_val_prev))
+
+            # a = myhash(a)
+            self.build_hash_scalar(a_addr, t1, t2)
+
+            # offset = 1 + (a % 2)
+            self.add("alu", ("%", parity, a_addr, two))
+            self.add("alu", ("+", offset, parity, one))
+
+            # next_idx = 2*idx + offset
+            self.add("alu", ("+", next_idx, idx_addr, idx_addr))
+            self.add("alu", ("+", next_idx, next_idx, offset))
+
+            # bounds wrap
+            self.add(
+                "alu",
+                ("<", in_bounds, next_idx, self.scratch["n_nodes"]),
+            )
+            self.add("flow", ("select", next_idx, in_bounds, next_idx, zero))
+
+            # idx[j] = next_idx
+            self.add("flow", ("select", idx_addr, one, next_idx, zero))
+
+            # val[j] = a
+            self.add("alu", ("+", val_addr, a_addr, zero))
+
+        # Main rounds, each with lane-wise software pipelining
+        for h in range(rounds):
+            if batch_size == 0:
+                continue
+
+            # Warmup: load node_val_prev for lane 0
+            # addr = forest_values_p + idx[0]
+            idx0_addr = s_idx_base + 0
+            self.add("alu", ("+", tmp1, self.scratch["forest_values_p"], idx0_addr))
+            self.add("load", ("load", node_val_prev, tmp1))
+
+            # Pipeline over lanes 1..batch_size-1
+            for i in range(1, batch_size):
+                # Stage A: load node_val_curr for lane i
+                idx_i_addr = s_idx_base + i
+                self.add(
+                    "alu",
+                    ("+", tmp1, self.scratch["forest_values_p"], idx_i_addr),
+                )
+                self.add("load", ("load", node_val_curr, tmp1))
+
+                # Stage B: process lane i-1 using node_val_prev
+                emit_stage_b(i - 1)
+
+                # Advance pipeline: node_val_prev = node_val_curr
+                self.add("alu", ("+", node_val_prev, node_val_curr, zero))
+
+            # Flush last lane (batch_size-1) using final node_val_prev
+            emit_stage_b(batch_size - 1)
+
+        # Write final indices and values back to memory
+        for i in range(batch_size):
+            off = self.scratch_const(i)
+
+            # idx[i]
+            self.add("alu", ("+", tmp1, self.scratch["inp_indices_p"], off))
+            self.add("store", ("store", tmp1, s_idx_base + i))
+
+            # val[i]
+            self.add("alu", ("+", tmp1, self.scratch["inp_values_p"], off))
+            self.add("store", ("store", tmp1, s_val_base + i))
+
+
 def run_wrong_fast_kernel():
     random.seed(123)
     forest_height, rounds, batch_size = 10, 16, 256
@@ -346,15 +513,12 @@ def run_node_centric_kernel_small():
     for _ in reference_kernel2(mem_ref, value_trace):
         pass
 
-    rounds_ref = mem_ref[0]
-    n_nodes_ref = mem_ref[1]
     batch_size_ref = mem_ref[2]
-    forest_values_p = mem_ref[4]
     inp_indices_p = mem_ref[5]
     inp_values_p = mem_ref[6]
 
-    idx_machine = mem[inp_indices_p : inp_indices_p + batch_size_ref]
-    val_machine = mem[inp_values_p : inp_values_p + batch_size_ref]
+    idx_machine = machine.mem[inp_indices_p : inp_indices_p + batch_size_ref]
+    val_machine = machine.mem[inp_values_p : inp_values_p + batch_size_ref]
     idx_ref = mem_ref[inp_indices_p : inp_indices_p + batch_size_ref]
     val_ref = mem_ref[inp_values_p : inp_values_p + batch_size_ref]
 
@@ -367,6 +531,59 @@ def run_node_centric_kernel_small():
         print("Values (ref):     ", val_ref)
 
 
+def run_pipelined_kernel_small():
+    """
+    Run the experimental pipelined-rounds kernel on a small instance to
+    measure its behavior and verify correctness.
+    """
+    random.seed(123)
+    forest_height, rounds, batch_size = 4, 4, 16
+    forest = Tree.generate(forest_height)
+    inp = Input.generate(forest, batch_size, rounds)
+    mem = build_mem_image(forest, inp)
+
+    kb = PipelinedRoundsKernelBuilder()
+    kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
+
+    machine = Machine(
+        mem,
+        kb.instrs,
+        kb.debug_info(),
+        n_cores=N_CORES,
+        trace=False,
+        value_trace={},
+    )
+    machine.run()
+    print(
+        "Pipelined-rounds kernel cycles (height=4, rounds=4, batch=16):",
+        machine.cycle,
+    )
+
+    # Compare against reference to confirm correctness
+    mem_ref = build_mem_image(forest, inp)
+    value_trace = {}
+    for _ in reference_kernel2(mem_ref, value_trace):
+        pass
+
+    batch_size_ref = mem_ref[2]
+    inp_indices_p = mem_ref[5]
+    inp_values_p = mem_ref[6]
+
+    idx_machine = machine.mem[inp_indices_p : inp_indices_p + batch_size_ref]
+    val_machine = machine.mem[inp_values_p : inp_values_p + batch_size_ref]
+    idx_ref = mem_ref[inp_indices_p : inp_indices_p + batch_size_ref]
+    val_ref = mem_ref[inp_values_p : inp_values_p + batch_size_ref]
+
+    match = (idx_machine == idx_ref) and (val_machine == val_ref)
+    print("Pipelined-rounds kernel matches reference:", match)
+    if not match:
+        print("Indices (machine):", idx_machine)
+        print("Indices (ref):    ", idx_ref)
+        print("Values (machine): ", val_machine)
+        print("Values (ref):     ", val_ref)
+
+
 if __name__ == "__main__":
     run_wrong_fast_kernel()
     run_node_centric_kernel_small()
+    run_pipelined_kernel_small()

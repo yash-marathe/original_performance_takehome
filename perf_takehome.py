@@ -596,14 +596,18 @@ class KernelBuilder:
         s_idx_base = self.alloc_scratch("s_idx", batch_size)
         s_val_base = self.alloc_scratch("s_val", batch_size)
 
-        for vec_i in range(0, batch_size, VLEN):
-            vec_offset_const = self.scratch_const(vec_i)
+        # Initialize base addresses for vector loads
+        self.add(
+            "flow",
+            ("add_imm", addr_idx_base, self.scratch["inp_indices_p"], 0),
+        )
+        self.add(
+            "flow",
+            ("add_imm", addr_val_base, self.scratch["inp_values_p"], 0),
+        )
 
+        for vec_i in range(0, batch_size, VLEN):
             # Load indices into scratch: s_idx_base[vec_i:vec_i+VLEN]
-            self.add(
-                "alu",
-                ("+", addr_idx_base, self.scratch["inp_indices_p"], vec_offset_const),
-            )
             self.add(
                 "load",
                 ("vload", s_idx_base + vec_i, addr_idx_base),
@@ -611,13 +615,20 @@ class KernelBuilder:
 
             # Load values into scratch: s_val_base[vec_i:vec_i+VLEN]
             self.add(
-                "alu",
-                ("+", addr_val_base, self.scratch["inp_values_p"], vec_offset_const),
-            )
-            self.add(
                 "load",
                 ("vload", s_val_base + vec_i, addr_val_base),
             )
+
+            # Advance base addresses for next vector chunk, except after last
+            if vec_i + VLEN < batch_size:
+                self.add(
+                    "flow",
+                    ("add_imm", addr_idx_base, addr_idx_base, VLEN),
+                )
+                self.add(
+                    "flow",
+                    ("add_imm", addr_val_base, addr_val_base, VLEN),
+                )
         
         # ===== MAIN VECTORIZED LOOP (STATE IN SCRATCH, UNROLLED BY 4) =====
         # Process batch_size items in groups of 4 * VLEN. For each group of
@@ -744,26 +755,37 @@ class KernelBuilder:
         # ===== WRITE FINAL RESULTS BACK TO MEMORY =====
         # After all rounds, copy the scratch-backed indices and values back to
         # the input arrays in memory in vector chunks.
-        for vec_i in range(0, batch_size, VLEN):
-            vec_offset_const = self.scratch_const(vec_i)
 
-            self.add(
-                "alu",
-                ("+", addr_idx_base, self.scratch["inp_indices_p"], vec_offset_const),
-            )
+        # Reinitialize base addresses for vector stores
+        self.add(
+            "flow",
+            ("add_imm", addr_idx_base, self.scratch["inp_indices_p"], 0),
+        )
+        self.add(
+            "flow",
+            ("add_imm", addr_val_base, self.scratch["inp_values_p"], 0),
+        )
+
+        for vec_i in range(0, batch_size, VLEN):
             self.add(
                 "store",
                 ("vstore", addr_idx_base, s_idx_base + vec_i),
             )
 
             self.add(
-                "alu",
-                ("+", addr_val_base, self.scratch["inp_values_p"], vec_offset_const),
-            )
-            self.add(
                 "store",
                 ("vstore", addr_val_base, s_val_base + vec_i),
             )
+
+            if vec_i + VLEN < batch_size:
+                self.add(
+                    "flow",
+                    ("add_imm", addr_idx_base, addr_idx_base, VLEN),
+                )
+                self.add(
+                    "flow",
+                    ("add_imm", addr_val_base, addr_val_base, VLEN),
+                )
         
         # Match the pause in reference implementation
         self.add("flow", ("pause",))

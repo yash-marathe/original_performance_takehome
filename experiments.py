@@ -32,20 +32,7 @@ class WrongFastKernelBuilder(KernelBuilder):
         tmp2 = self.alloc_scratch("tmp2")
 
         # Load basic configuration
-        init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
-        ]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+        self.load_problem_config(tmp1)
 
         # For simplicity, operate directly from memory each round, scalar style.
         self.add("flow", ("pause",))
@@ -109,7 +96,6 @@ class WrongFastKernelBuilder(KernelBuilder):
                 # We skip actual stores here; this kernel is purely for timing.
 
         self.add("flow", ("pause",))
-        self.schedule_vliw()
 
 
 class NodeCentricKernelBuilder(KernelBuilder):
@@ -121,23 +107,6 @@ class NodeCentricKernelBuilder(KernelBuilder):
     that node. This is correctness-preserving but extremely expensive; it is
     intended only for small problem sizes to study behavior.
     """
-
-    def build_hash_scalar(self, a_addr: int, tmp1: int, tmp2: int):
-        """
-        Scalar version of myhash(a), operating entirely in scratch.
-
-        a_addr: scratch addr holding 'a' (updated in place).
-        tmp1, tmp2: scratch temporaries.
-        """
-        for op1, val1, op2, op3, val3 in HASH_STAGES:
-            c1 = self.scratch_const(val1)
-            c3 = self.scratch_const(val3)
-            # tmp1 = op1(a, C1)
-            self.add("alu", (op1, tmp1, a_addr, c1))
-            # tmp2 = op3(a, C3)
-            self.add("alu", (op3, tmp2, a_addr, c3))
-            # a    = op2(tmp1, tmp2)
-            self.add("alu", (op2, a_addr, tmp1, tmp2))
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -152,20 +121,7 @@ class NodeCentricKernelBuilder(KernelBuilder):
         tmp2 = self.alloc_scratch("tmp2")
 
         # Load configuration from memory into scratch
-        init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
-        ]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+        self.load_problem_config(tmp1)
 
         # Constants
         zero = self.scratch_const(0)
@@ -303,17 +259,6 @@ class PipelinedRoundsKernelBuilder(KernelBuilder):
     It is scalar and intended only for small problem sizes.
     """
 
-    def build_hash_scalar(self, a_addr: int, tmp1: int, tmp2: int):
-        """
-        Scalar myhash(a) implemented with ALU ops over scratch.
-        """
-        for op1, val1, op2, op3, val3 in HASH_STAGES:
-            c1 = self.scratch_const(val1)
-            c3 = self.scratch_const(val3)
-            self.add("alu", (op1, tmp1, a_addr, c1))
-            self.add("alu", (op3, tmp2, a_addr, c3))
-            self.add("alu", (op2, a_addr, tmp1, tmp2))
-
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
@@ -327,20 +272,7 @@ class PipelinedRoundsKernelBuilder(KernelBuilder):
         tmp2 = self.alloc_scratch("tmp2")
 
         # Load configuration from memory into scratch
-        init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
-        ]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+        self.load_problem_config(tmp1)
 
         # Constants
         zero = self.scratch_const(0)
@@ -482,20 +414,8 @@ class UniformLoadsKernelBuilder(KernelBuilder):
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
 
-        init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
-        ]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+        # Load configuration from memory into scratch
+        self.load_problem_config(tmp1)
 
         # Debug: record n_nodes and rounds into the core's trace buffer
         self.add("flow", ("trace_write", self.scratch["n_nodes"]))

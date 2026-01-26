@@ -131,6 +131,38 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
+    def load_problem_config(self, tmp_scratch: int):
+        """
+        Load the standard problem configuration scalars from memory into scratch.
+        This helper preserves the original instruction sequence used across kernels.
+        """
+        init_vars = [
+            "rounds",
+            "n_nodes",
+            "batch_size",
+            "forest_height",
+            "forest_values_p",
+            "inp_indices_p",
+            "inp_values_p",
+        ]
+        for v in init_vars:
+            self.alloc_scratch(v, 1)
+        for i, v in enumerate(init_vars):
+            self.add("load", ("const", tmp_scratch, i))
+            self.add("load", ("load", self.scratch[v], tmp_scratch))
+
+    def build_hash_scalar(self, a_addr: int, tmp1: int, tmp2: int):
+        """
+        Scalar myhash(a) implemented with ALU ops over scratch.
+        Used by experimental scalar kernels in experiments.py.
+        """
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            c1 = self.scratch_const(val1)
+            c3 = self.scratch_const(val3)
+            self.add("alu", (op1, tmp1, a_addr, c1))
+            self.add("alu", (op3, tmp2, a_addr, c3))
+            self.add("alu", (op2, a_addr, tmp1, tmp2))
+
     def build_hash_vectorized(self, v_val, v_tmp1, v_tmp2, v_tmp3, round, vec_i):
         """
         Vectorized hash function that processes 8 values in parallel.
@@ -461,15 +493,7 @@ class KernelBuilder:
         tmp3 = self.alloc_scratch("tmp3")
         
         # Load initial configuration from memory
-        init_vars = [
-            "rounds", "n_nodes", "batch_size", "forest_height",
-            "forest_values_p", "inp_indices_p", "inp_values_p"
-        ]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+        self.load_problem_config(tmp1)
         
         # Allocate constants
         zero_const = self.scratch_const(0)
